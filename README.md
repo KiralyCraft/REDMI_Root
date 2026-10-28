@@ -68,7 +68,18 @@ for reference, so regenerating them is normally unnecessary.
 ```bash
 # Connect the tablet over USB, then:
 tools/reroot.sh
+
+# Several Android devices attached? Name the target explicitly:
+SERIAL=<adb serial> tools/reroot.sh
+
+# Read-only preflight (device identity, kernel, profile, binary hash) without
+# pushing or executing anything:
+tools/reroot.sh --check
 ```
+
+The script refuses to guess when more than one device is attached and refuses to run
+against a device whose `ro.product.device` is not `dizi` (override with
+`ALLOW_ANY_DEVICE=1`).
 
 The script runs the whole flow automatically. The **tablet may reboot a few times**
 during the run, which is normal: the exploit's heap reclaim is probabilistic (roughly a

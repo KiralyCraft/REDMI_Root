@@ -11,7 +11,10 @@ authoritative history. Convention per AGENTS.md: read this before working in the
 - Build-exact profile for the target build **derived offline and written**
   (`profiles/5.10.209-…-ab12292661.{bin,conf}`): every symbol value comes from the device's own Image
   (kallsyms decode + three pointer-chase anchors), route geometry from the device's own bytes.
-- Exploit binary now **built** on the remote machine.
+- Exploit binary now **built** on the remote machine, copied to `build/native/ghostlock`, and
+  cross-checked against the source tree.
+- Run prepared but **not executed**: `tools/reroot.sh --check` passes read-only preflight on the
+  tablet; no push and no exploit execution has happened.
 - Remaining gaps: device gate run (needs explicit authorization) to confirm the empirical fields
   (`kernel_phys_load`, `skb_reclaim_sends`, `skb_frag_bias`) and end-to-end success.
 
@@ -371,6 +374,35 @@ Deliberate content updates made while translating (not merely wording):
   notes matching the old Chinese strings no longer apply.
 
 No adb command was run against either device during this work.
+
+### 2026-10-28 — Gate run staged (binary + script), preflight only, nothing executed
+
+**Binary staged.** Copied `/bigdata/dizi_root/redmi-root-build/build/native/ghostlock` to
+`build/native/ghostlock` (2,602,168 B, SHA-256
+`14cb155faafee0e48d9b3e75b07a6daa5e8217515778ebd127f0b45fe5c0ba4f`, aarch64 PIE built with NDK
+r29, targets Android 35). The VM build tree's `src/` is byte-identical to this repo's `src/`
+(125 files compared by SHA-256) except `src/Makefile`, which differed only in the `product`
+target's echo string translated today; the VM copy was updated to match. So the binary corresponds
+to the source that produced the 5.10.236 gate build, and `build/` stays git-ignored.
+
+**Script hardened for this bench.** `tools/reroot.sh` now (a) targets one device via
+`SERIAL`/`ANDROID_SERIAL`, aborting when several devices are attached and none was named — every
+adb call goes through `-s <serial>`; (b) refuses to proceed unless `ro.product.device` is `dizi`
+(`ALLOW_ANY_DEVICE=1` overrides); (c) gained `--check`, a read-only preflight that prints device
+identity, kernel release, SELinux state, profile selection and both SHA-256s without pushing or
+executing anything. `bash -n` passes.
+
+**Bench state.** Both devices remain attached: `a37b82` (msm8916, untouched — no command was ever
+sent to it) and `e5778c5b` (target). `SERIAL=e5778c5b tools/reroot.sh --check` output:
+
+- model `dizi` / `2405CRPFDC`, OS1.0.19.0.UNSCNXM, Android 14, patch 2024-12-01
+- `uname -r` = `5.10.209-android12-9-00019-g4ea09a298bb4-ab12292661` → resolves to the new profile
+- SELinux `enforcing=1` (not rooted, no KernelSU)
+- profile 1993 B SHA-256 `c343b7e1157617c48c776ea0413d905c9d9558999bee3d270d8e781989213953`
+
+**Deliberately not done:** no push to `/data/local/tmp`, no execution of `ghostlock`, no state
+change on the tablet. Waiting for explicit authorization for the gate run (expect reboots; a miss
+panics the kernel).
 
 ## Open items / next actions
 
