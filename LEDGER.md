@@ -442,12 +442,13 @@ Post-remediation runs after installing KernelSU + pushing ksud (all on `e5778c5b
 - **Run 3** (22:39–22:46, `tools/reroot.sh`, log `/tmp/opencode/gate-209-run3-223947.log`): 6 attempts,
   W1 hit 1/6, one W2 try, panics.
 - **Run 4** (22:48–22:52, instrumented driver): 4 attempts, 0/4 W1 hits — panics during the race.
-- **Run 5** (22:53+, instrumented driver with full stdout capture, log `/tmp/opencode/gate-209-run5.log`):
-  W1 hit rate ≈ 4/21; ~10 W2 tries, **zero landings**: the route reports `success=1` (race hit bookkeeping)
-  but `verify_w2_stage` always reads `child uid = 2000` → "W2 failed after 1 rounds". Collision screens
-  show 11/7–14/7 (expected 7), consistent with the carried `skb_reclaim_sends=16`/`skb_frag_bias=384`
-  geometry mismatching the fresh-boot heap state — but **not falsified**: Run 1 landed once with the same
-  profile, so these values may be heap-state dependent rather than wrong.
+- **Run 5** (22:53–23:51+, instrumented driver with full stdout capture, log `/tmp/opencode/gate-209-run5.log`):
+  44 attempts, W1 hit 7/44 (~16%, with a panic on most misses), 9 W2 tries, **zero landings**: the route
+  reports `success=1` (race-hit bookkeeping) but `verify_w2_stage` always reads `child uid = 2000` →
+  "W2 failed after 1 rounds". Collision screens report 9/7–14/7 — passing, but unstable relative to the
+  expected 7-slot geometry; consistent with `skb_reclaim_sends=16`/`skb_frag_bias=384` being
+  heap-state dependent, **not confirmed** by any post-remediation attempt — and **not falsified**:
+  Run 1 landed once with the same profile. The instrumented loop remains running to catch a landing.
 - **Key discriminator**: `/data/local/tmp/.ghostlock_ksu.log` mtime is still 21:57 device-clock — Run 1's
   pre-push execution. No post-push W2 landing has ever executed the root script, so `[!] ksud missing` in
   the log is a stale artifact; the post-push handoff (`late-load kmi=android12-5.10`) remains untested.
@@ -510,12 +511,46 @@ Reading of this evidence (inferences, not device-verified):
    state must live in some QCOM-side store (RPMB / `RwDeviceState` blob / `featenabler` /
    `qweslicstore`) — **which one is unconfirmed**.
 
-Blocker for reading the actual `oem unlock` handler: Ghidra imports these images as raw data (no
-section headers), and only the `LinuxLoader` PE disassembles (1,296 functions). The fastboot/MiToken
-strings sit past that module's raw data, so Ghidra reports no cross-references to them. To read the
-handler we need either a correct FV file-entry walk of the decoded volume, or a validated AArch64
-adrp/add reference scanner — the naive bit-field decode gives targets that disagree with Ghidra's
-own disassembly, so it must be calibrated before it can be trusted.
+**The handler is now read.** The earlier blocker was a parsing mistake, not a missing module: the
+entry-header `DataLength` (`0x9AA78`) is not the module size. The PE section table shows `.text` at
+raw pointer `0x1000` with raw size `0xBA000`, `.data` `0x24000`, `.reloc `0x1000` — so the whole
+decoded volume is one module, and the "string pool" is inside `.text`. Re-imported whole
+(`/tmp/opencode/ghidra/abl_full.efi`, 917,504 bytes), Ghidra resolves cross-references. Handler map
+(program `abl_full.efi`, 1,344 functions):
+
+- `FUN_0005ad20` — fastboot init. Looks up partition `frp` and takes **the last byte of the FRP
+  partition & 1 as `IsAllowUnlock`** (`Error Reading FRP partition: %r`, `IsAllowUnlock is %d`).
+- `FUN_0005db28` — the unlock command path: locate MiToken protocol → get token length → get token →
+  verify; failure prints `Token Verify Failed, Reboot the device`; success calls `FUN_00048908(0,1)`
+  then `FUN_00048908(1,1)`.
+- `FUN_00048908(index, value)` — index 0 → `FUN_00048e10` (unlock), index 1 → `FUN_00048ee8`
+  (unlock-critical). Each sets one byte inside a **0x998-byte device-info blob** whose magic is
+  `ANDROID-BOOT!` (flags at blob offsets 13, 14, 15 = unlock, unlock-critical, charging-screen), then
+  persists the blob with `FUN_00030ad8(1, blob, 0x998)` (`VBRwDevice`). Failure prints
+  `Unable set the unlock value: %r`. It also writes 0x440 bytes to the **misc** partition
+  (GPT type GUID `82ACC91F-357C-4A68-9C8F-689E1B1A23A1`) with the `--wipe_data` recovery command.
+- `FUN_000493a0` — state init. VB read of the blob; **if the magic matches, the stored bytes are used
+  as the authoritative state with no integrity or signature check**. Only when the magic mismatches is
+  the state re-derived from the TrustZone secure state (`FUN_00031870`, the SMC wrapper that returns
+  `(state>>2 ^ 0xff)&1`) and then written back.
+- `FUN_000486d8` / `FUN_000486e8` / `FUN_00048708` — the three flag getters. The AVB path
+  (`FUN_0000b3e8`) uses the unlock flag to add `AVB_SLOT_VERIFY_FLAGS_ALLOW_VERIFICATION_ERROR` and to
+  set `androidboot.verifiedbootstate` (orange when unlocked, `State: Unlocked, AvbSlotVerify returned
+  %a, continue boot`).
+- The fastboot flash/erase handlers refuse in locked state (`Flashing is not allowed in Lock State`,
+  `Flashing is not allowed for protected Partitions`), so fastboot alone cannot write the blob.
+
+Reading: **the server signature gates the *command*, not the *storage*.** Nothing in ABL authenticates
+the persisted blob — the unlock flag is a writable byte in an unauthenticated structure, and the TZ
+state is only a fallback default when the blob's magic is absent. That is the concrete offline
+candidate: write `ANDROID-BOOT!` + byte 13 = 1 into the blob directly (from Android root through the
+block device), reboot, and ABL reports unlocked with AVB verification errors tolerated. The fastboot
+`IsAllowUnlock` flag is likewise just the last byte of the FRP partition.
+
+Still unconfirmed: **which partition the VB protocol's blob actually lives in** (the protocol producer is
+a DXE driver not present in the decodable volume; `frp` is the strong candidate because the fastboot
+path reads it, but the code path uses a GUID, not a name). Read-only device check that settles it: dump
+the FRP/persist/misc partitions, look for `ANDROID-BOOT!` at offset 0 and read byte 13.
 
 Independent confirmation from `dev-zetta/xiaomi_redmi_pad_unlocker` (Redmi Pad SE, `xun`): the
 Qualcomm ABL argument-injection flaw (`fastboot oem set-gpu-preemption`, accepts
@@ -539,12 +574,13 @@ remaining barrier is the server signature plus the location of the lock flag.
    `skb_frag_bias`); panics/reboots expected; requires explicit user authorization.
 5. The new profile is derived and build-exact but **not gate-verified** — record a cold-boot PASS here
    before treating it as production-ready.
-6. ⏳ Bootloader vulnerability hunt. The ABL volume now decodes (LZMA-alone framing) and its
-   `oem unlock` / MiToken strings are recovered, but the handler code is not yet disassembled: either
-   walk the decoded volume's FV file entries correctly, or calibrate an AArch64 adrp/add reference
-   scanner against Ghidra's own disassembly before trusting it. Also open: which store holds dizi's
-   lock flag — there is no EDK2 variable store on this build, so a GBL-style "UEFI app sets the
-   variable" trick has nothing to write to.
+6. ⏳ Bootloader vulnerability hunt. The ABL volume decodes (LZMA-alone framing) and the
+   `oem unlock` handler is now read: the unlock flag is an unauthenticated byte in the persisted
+   `ANDROID-BOOT!` device-info blob, so the server signature gates the command, not the storage.
+   Remaining work: (a) identify which partition holds the blob (`frp` is the candidate, unconfirmed),
+   (b) confirm on device read-only, (c) only then consider whether writing it is a real unlock path —
+   note there is no EDK2 variable store in these images, so the GBL-style "UEFI app sets the variable"
+   trick has nothing documented to write to on this build.
 
 ## Constraints reminder
 
