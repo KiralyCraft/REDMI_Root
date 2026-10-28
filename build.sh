@@ -1,9 +1,9 @@
 #!/bin/bash
-# Redmi Pad Pro Root 一键构建脚本
+# Redmi Pad Pro root one-click build script
 set -e
 cd "$(dirname "$0")"
 
-# 1. 定位 NDK
+# 1. Locate the NDK
 if [ -z "$ANDROID_NDK_HOME" ] && [ -z "$ANDROID_NDK_ROOT" ]; then
     for c in "$HOME/Library/Android/sdk/ndk" "$HOME/Android/Sdk/ndk" /opt/homebrew/share/android-commandlinetools/ndk; do
         if [ -d "$c" ]; then
@@ -13,21 +13,21 @@ if [ -z "$ANDROID_NDK_HOME" ] && [ -z "$ANDROID_NDK_ROOT" ]; then
     done
 fi
 if [ -z "$ANDROID_NDK_HOME" ] || [ ! -d "$ANDROID_NDK_HOME" ]; then
-    echo "[!] 找不到 Android NDK。请安装 NDK 或设置 ANDROID_NDK_HOME"
-    echo "    macOS: brew install --cask android-commandlinetools 后装 NDK，"
-    echo "    或直接 https://developer.android.com/ndk/downloads"
+    echo "[!] Android NDK not found. Install the NDK or set ANDROID_NDK_HOME"
+    echo "    macOS: brew install --cask android-commandlinetools, then install the NDK,"
+    echo "    or download it from https://developer.android.com/ndk/downloads"
     exit 1
 fi
 echo "[*] NDK: $ANDROID_NDK_HOME"
 export ANDROID_NDK_HOME
 
-# 2. 构建
+# 2. Build
 make -C src ghostlock
 BIN=build/native/ghostlock
 if [ -f "$BIN" ]; then
-    echo "[+] 构建成功: $BIN"
-    echo "[*] 下一步: 平板开 USB 调试连上电脑，运行 tools/reroot.sh"
+    echo "[+] build succeeded: $BIN"
+    echo "[*] next: enable USB debugging on the tablet, connect it, and run tools/reroot.sh"
 else
-    echo "[!] 构建失败"
+    echo "[!] build failed"
     exit 1
 fi

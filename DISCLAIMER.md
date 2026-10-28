@@ -1,76 +1,84 @@
-# 法律免责声明 & 使用合规须知
+# Legal disclaimer & acceptable-use notice
 
-> 本声明基于通用开源安全工具免责声明模板制定，适用于 REDMI_Root
-> （Redmi Pad Pro 内核 Root 方案，以下简称「本工具」）。**使用本工具即表示你
-> 已完整阅读并同意以下全部条款。**
+> This notice follows a standard template for open-source security tools and applies to
+> REDMI_Root (the Redmi Pad Pro kernel root project, "the tool"). **Using the tool means
+> you have read and agree to every clause below.**
 
-## 1. 工具定位
+## 1. What this tool is
 
-本工具为网络安全学术研究、授权安全测试、企业内部风险自查、个人自有设备
-研究用途的开源技术工具。
+This tool is open-source technical software for academic security research, authorized
+security testing, internal risk self-assessment, and research on devices you personally
+own.
 
-本工具所有功能仅面向拥有合法授权的测试场景（包括使用者本人自有的设备），
-旨在提升网络安全防御能力、助力漏洞合规治理、推进安全技术学术研究。
+Every capability in this tool is intended for lawfully authorized testing scenarios
+(including devices owned by the user) and exists to improve defensive security, support
+compliant vulnerability management and advance academic security research.
 
-## 2. 严格授权使用原则
+## 2. Strictly authorized use
 
-所有使用者必须提前获得目标系统的书面合法授权，或仅在**本人合法所有的
-设备**上使用。
+Every user must obtain prior written authorization for the target system, or use the tool
+only on **devices they lawfully own**.
 
-严禁在无授权、越权、超范围情况下，对以下对象进行探测、提权、数据获取、
-自动化测试：
+It is strictly forbidden to probe, escalate privileges on, extract data from or
+automatically test the following without authorization or beyond the granted scope:
 
-- 互联网公网任意未授权系统；
-- 金融、能源、政务、运营商、交通等关键信息基础设施；
-- 第三方企业、个人、公有云任意业务系统；
-- **他人所有的手机、平板等终端设备**；
-- 任何法律法规禁止测试的信息系统。
+- any unauthorized system reachable over the public internet;
+- critical information infrastructure (finance, energy, government, telecom,
+  transportation, etc.);
+- any business system of a third-party company, individual or public cloud;
+- **phones, tablets and other devices owned by someone else**;
+- any information system that applicable law forbids testing.
 
-未授权测试即属于违法行为，使用者自行承担全部法律责任。
+Unauthorized testing is unlawful, and the user bears full legal responsibility.
 
-## 3. 禁止滥用条款
+## 3. Prohibition of abuse
 
-所有使用者承诺：
+Every user agrees:
 
-1. 不得利用本工具实施非法入侵、非法控制、数据窃取、流量攻击、漏洞滥用
-   等违法犯罪行为；
-2. 不得将本工具用于黑产、牟利、恶意破坏、未授权批量测试、网络骚扰等
-   场景；
-3. 不得绕过、破解本工具内置的安全限制、风控机制用于非法用途；
-4. 不得用于危害国家网络安全、扰乱公共秩序、侵犯他人合法权益的活动；
-5. 不得利用本工具对他人设备绕过锁屏、刷机锁（Bootloader Lock）、
-   防盗保护等安全机制。
+1. not to use this tool for unlawful intrusion, unlawful control, data theft, traffic
+   attacks, exploitation or any other criminal activity;
+2. not to use this tool for cybercrime, profit, malicious damage, unauthorized bulk
+   testing, harassment or similar purposes;
+3. not to bypass or break the tool's built-in safety limits or risk controls for unlawful
+   purposes;
+4. not to use it in activities that endanger national cybersecurity, disrupt public order
+   or infringe the lawful rights of others;
+5. not to use this tool to bypass lock screens, bootloader locks, anti-theft protection
+   or other security mechanisms on someone else's device.
 
-## 4. 责任边界（核心免责）
+## 4. Limits of liability (core disclaimer)
 
-1. 项目开源作者、维护团队、贡献者：仅提供公开的技术代码与学术实现，
-   不参与、不知情、不协助任何第三方的非法使用行为，不对第三方滥用产生
-   的任何后果承担刑事、行政、民事连带责任。
-2. 本工具技术中立，合法合规用途明确，任何使用者的违法操作均为独立
-   个人行为，与项目作者无关。
-3. 本工具为内核级漏洞利用代码，运行过程**可能触发设备内核崩溃、自动
-   重启、数据损坏或丢失**。作者不对使用过程中造成的设备损坏、数据丢失、
-   保修失效等后果承担责任。
+1. The open-source authors, maintainers and contributors provide public technical code
+   and academic implementations only. They do not participate in, know about or assist
+   any third party's unlawful use, and accept no criminal, administrative or civil joint
+   liability for the consequences of third-party abuse.
+2. The tool is technically neutral and its lawful uses are clear. Any unlawful action is
+   the independent act of the individual user and unrelated to the project authors.
+3. This tool is kernel-level exploit code. Running it **may panic the device kernel,
+   reboot the device automatically, or damage or destroy data**. The authors are not
+   liable for device damage, data loss, voided warranties or similar consequences.
 
-## 5. 强制合规义务
+## 5. Mandatory compliance obligations
 
-使用者使用本工具即默认表示：
+By using this tool the user confirms that they:
 
-- 已充分知晓《中华人民共和国网络安全法》；
-- 已充分知晓《中华人民共和国刑法》第 285 条、第 286 条相关规定；
-- 已具备合法网络安全测试资质或授权资质，或仅在本人合法所有的设备上
-  使用；
-- 自愿承担所有使用风险及法律后果。
+- are fully aware of the Cybersecurity Law of the People's Republic of China;
+- are fully aware of Articles 285 and 286 of the Criminal Law of the People's Republic of
+  China;
+- hold a lawful security-testing qualification or authorization, or use the tool only on
+  devices they lawfully own;
+- voluntarily accept all risks and legal consequences of use.
 
-## 6. 违规处置机制
+## 6. Enforcement
 
-项目团队保留以下权利：
+The project team reserves the right to:
 
-- 随时关停仓库、终止分发、更新风控限制；
-- 举报、记录、留存恶意滥用行为证据；
-- 拒绝为非法使用者提供任何技术答疑、指导、更新、协助。
+- shut down the repository, stop distribution or update risk controls at any time;
+- report, record and preserve evidence of malicious abuse;
+- refuse technical support, guidance, updates or assistance to unlawful users.
 
-## 7. 最终声明
+## 7. Final statement
 
-本工具严禁非法滥用。任何违法使用行为，由行为人独立承担全部法律责任，
-与项目开发、维护、贡献团队无关。
+Abuse of this tool is strictly forbidden. Any unlawful use is the sole responsibility of
+the person who performed it and is unrelated to the project's development, maintenance
+and contributor teams.

@@ -1,89 +1,109 @@
-# REDMI_Root — Redmi Pad Pro 内核 Root 方案
+# REDMI_Root — kernel root for the Redmi Pad Pro
 
 <div align="center">
 
-[![哔哩哔哩 B 站主页](https://img.shields.io/badge/%E5%93%94%E5%93%A9%E5%93%94%E5%93%A9-B%E7%AB%99%E4%B8%BB%E9%A1%B5-00A1D6?style=for-the-badge&logo=bilibili&logoColor=white)](https://space.bilibili.com/22940901)
+[![Bilibili homepage](https://img.shields.io/badge/Bilibili-channel-00A1D6?style=for-the-badge&logo=bilibili&logoColor=white)](https://space.bilibili.com/22940901)
 
-📺 **关注我的 B 站主页：<https://space.bilibili.com/22940901>** 📺
+📺 **Follow my Bilibili channel: <https://space.bilibili.com/22940901>** 📺
 
 </div>
 
-针对 **Redmi Pad Pro / POCO Pad（dizi，代号 parrot）** 的一键内核 Root 工具。
-基于 CVE-2026-43499（futex PI UAF，上游项目
-[YuKongA/ghostlock-app](https://github.com/YuKongA/ghostlock-app) 的 select_stack 路由）
-完成对该机型的完整适配与真机验证。
+A one-click kernel root tool for the **Redmi Pad Pro / POCO Pad (dizi, codename parrot)**.
+It is based on CVE-2026-43499 (futex PI UAF, using the `select_stack` route from
+[YuKongA/ghostlock-app](https://github.com/YuKongA/ghostlock-app)) and has been fully
+adapted and verified on real hardware.
 
-- 设备：Redmi Pad Pro (2405CRPFDC) / POCO Pad
-- 内核：`5.10.236-android12-9-00003-gfb24cf99ad97-ab14313284`
-- 系统：HyperOS 3（Android 16）实测通过
-- 效果：临时 Root + KernelSU（越狱模式 / LKM，不解锁 BL、不改 boot 镜像）
-- 真机门禁：连续 2 次冷启动全链路通过（记录见 `docs/device-gate-DIZI-01.md`）
+- Device: Redmi Pad Pro (2405CRPFDC) / POCO Pad
+- Kernels:
+  - `5.10.236-android12-9-00003-gfb24cf99ad97-ab14313284` — HyperOS 3 (Android 16),
+    device gate passed twice in a row (`docs/device-gate-DIZI-01.md`).
+  - `5.10.209-android12-9-00019-g4ea09a298bb4-ab12292661` — HyperOS 1.0.19.0.UNSCNXM
+    (Android 14). The profile was derived offline from that build's own kernel image
+    (kallsyms + pointer-chase anchors + device-verified stack frames); it has **not**
+    been through a device gate run yet, so no device-gate record exists for it.
+- Result: temporary root + KernelSU (jailbreak mode / LKM; no bootloader unlock, no boot
+  image modification)
+- Device gate: two consecutive cold-boot end-to-end passes (record in
+  `docs/device-gate-DIZI-01.md`)
 
-> 📖 **零基础学习 / 完整复现教程**（含原理图解与逐行脚本讲解）：
-> [docs/tutorial.md](docs/tutorial.md)
+A profile is never used across builds: `tools/reroot.sh` reads `uname -r` from the device
+and refuses to run when no profile for that exact build exists.
 
-## 工作原理（简版）
+> 📖 **Beginner-friendly walkthrough / full reproduction guide** (diagrams and
+> line-by-line script explanation): [docs/tutorial.md](docs/tutorial.md)
 
-利用内核 `remove_waiter()` 在 PI-futex 回滚路径操作错误任务的漏洞
-（CVE-2026-43499），通过 pselect 栈帧复用伪造 `rt_mutex_waiter`，在 PI 链
-调整优先级时触发受控内核写：W1 关闭 SELinux → W2 覆写子进程 cred 为
-`init_cred`（uid 0）→ 加载 KernelSU 内核模块。全程纯数据写，不触碰 CFI
-保护的控制流。
+## How it works (short version)
 
-## 要求
+The kernel's `remove_waiter()` operates on the wrong task during the PI-futex rollback
+path (CVE-2026-43499). The tool reuses a pselect stack frame to forge an
+`rt_mutex_waiter` and triggers a controlled kernel write while the PI chain is being
+re-prioritized: **W1** turns SELinux off, **W2** overwrites the child process's `cred`
+with `init_cred` (uid 0), then **W3** loads the KernelSU kernel module. Everything is a
+pure data write; control flow protected by CFI is never touched.
 
-- 上述机型与内核版本（设置 → 关于平板 → 内核版本核对）
-- 一台电脑（macOS / Linux），装好 **Android SDK Platform-Tools**（adb）
-- 平板开启 **USB 调试**（开发者选项）
-- 平板安装 [KernelSU 管理器](https://github.com/tiann/KernelSU/releases) APK
-  （Root 脚本会自动从管理器 APK 中提取 ksud 完成模块加载）
+## Requirements
 
-## 构建
+- The device model and kernel version listed above (check Settings → About tablet →
+  Kernel version)
+- A computer (macOS / Linux) with **Android SDK Platform-Tools** (adb) installed
+- **USB debugging** enabled on the tablet (Developer options)
+- [KernelSU manager](https://github.com/tiann/KernelSU/releases) APK installed on the
+  tablet (the root script extracts `ksud` from the manager APK to load the module)
+
+## Build
 
 ```bash
-# 安装 Android NDK（任一方式），然后：
+# Install the Android NDK (any of the usual ways), then:
 ./build.sh
 ```
 
-产物：`build/native/ghostlock`。脚本会自动探测常见 NDK 路径，
-也可手动指定：`ANDROID_NDK_HOME=/path/to/ndk ./build.sh`。
+Output: `build/native/ghostlock`. The script probes common NDK locations; you can also
+point it explicitly: `ANDROID_NDK_HOME=/path/to/ndk ./build.sh`.
 
-profile 已预构建（`profiles/*.bin`），随源码附 `.conf` 原文供参考，
-一般无需重新生成。
+Profiles are prebuilt (`profiles/*.bin`); a matching `.conf` is shipped next to each one
+for reference, so regenerating them is normally unnecessary.
 
-## 使用
+## Usage
 
 ```bash
-# 平板 USB 连接电脑后：
+# Connect the tablet over USB, then:
 tools/reroot.sh
 ```
 
-脚本自动完成全部流程，期间**平板可能自动重启若干次**（漏洞利用的概率性
-堆回收所致，单次命中率约 1/3~1/2，脚本会自动重试直到成功），看到
-`ROOTED + KernelSU 已激活` 即成。实测通常几分钟到二十几分钟。
+The script runs the whole flow automatically. The **tablet may reboot a few times**
+during the run, which is normal: the exploit's heap reclaim is probabilistic (roughly a
+1/3–1/2 chance per attempt), and the script retries until it succeeds. When you see
+`ROOTED + KernelSU active`, you are done. In practice this usually takes a few minutes to
+about twenty minutes.
 
-Root 为**越狱模式（重启失效）**：重启后重新运行 `reroot.sh` 即可；
-KernelSU 的模块与授权配置保存在 `/data/adb`，重 Root 后自动恢复。
+Root is **jailbreak mode (lost on reboot)**: just run `reroot.sh` again after a reboot.
+KernelSU modules and their authorization state live in `/data/adb` and are restored
+automatically after re-rooting.
 
-## 常见问题
+## FAQ
 
-- **运行中平板重启了？** 正常现象（未命中即内核 panic），脚本会自动等设备回来继续。
-- **一直失败？** 确认内核版本完全一致；不同 MIUI/HyperOS 版本内核不同则不能用本 profile。
-- **想恢复出厂？** 重启即回到无 Root 状态，不刷写任何分区，不留痕迹（除 `/data/adb` 中的 KernelSU 配置，可在管理器中卸载清除）。
+- **The tablet rebooted during the run?** That is expected (a missed attempt panics the
+  kernel); the script waits for the device to come back and continues.
+- **It keeps failing?** Make sure the kernel version matches exactly. A different
+  MIUI/HyperOS build ships a different kernel and cannot use this profile.
+- **How do I go back to stock?** A reboot returns the device to the unrooted state. No
+  partition is ever written, so nothing persists (except the KernelSU configuration in
+  `/data/adb`, which can be removed from the manager).
 
-## 免责声明
+## Disclaimer
 
-**使用本工具前请务必阅读 [DISCLAIMER.md](DISCLAIMER.md)（法律免责声明 &
-使用合规须知）。**
+**Read [DISCLAIMER.md](DISCLAIMER.md) (legal disclaimer & acceptable-use notice) before
+using this tool.**
 
-简要提示：本工具仅供安全研究、授权测试与**本人自有设备**使用；运行过程
-可能触发设备内核崩溃与自动重启（本方案不刷写分区，风险限于数据损坏级）；
-使用本工具即表示同意 DISCLAIMER.md 的全部条款，一切法律后果由使用者
-自行承担。
+In short: this tool is intended for security research, authorized testing and **devices
+you own**. Running it can panic and reboot the device kernel (no partition is written, so
+the risk is limited to data loss). Using this tool means you agree to every clause of
+DISCLAIMER.md; you are responsible for the consequences.
 
-## 致谢与许可
+## Credits and license
 
-- 上游项目：[YuKongA/ghostlock-app](https://github.com/YuKongA/ghostlock-app)
-- 漏洞研究：NebuSec（kernelCTF）与各社区适配者
-- 本项目以 Apache License 2.0 发布（见 `LICENSE`），源码包含上游项目的
-  修改版本（dizi 适配、5.10 select 路由修复等，详见 `docs/adaptation-plan.md`）。
+- Upstream project: [YuKongA/ghostlock-app](https://github.com/YuKongA/ghostlock-app)
+- Vulnerability research: NebuSec (kernelCTF) and the community adapters
+- Released under the Apache License 2.0 (see `LICENSE`). The source contains modified
+  parts of the upstream project (dizi adaptation, 5.10 select route fixes, etc.); see
+  `docs/adaptation-plan.md` for details.

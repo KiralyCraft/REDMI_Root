@@ -288,7 +288,7 @@ $(HOST_BUILD_DIR)/victim_context_test: core/tests/victim_context_test.cpp core/s
 
 product: ghostlock
 	@echo "=== ghostlock binary ready: $(GHOSTLOCK_BIN) ==="
-	@echo "构建 APK: .\gradlew.bat :app:assembleDebug"
+	@echo "Build APK: .\gradlew.bat :app:assembleDebug"
 
 clean:
 	rm -f $(GHOSTLOCK_BIN) ghostlock

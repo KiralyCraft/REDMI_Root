@@ -1,293 +1,315 @@
-# Redmi Pad Pro 内核 Root 完整学习教程
+# Complete kernel root tutorial for the Redmi Pad Pro
 
-> 从零理解并复现 dizi（Redmi Pad Pro / POCO Pad，内核
-> `5.10.236-android12-9-00003-gfb24cf99ad97-ab14313284`）的 Root 全过程。
-> 不需要任何内核漏洞利用基础，按章节顺序读即可。
+> Understand and reproduce the full root flow for dizi (Redmi Pad Pro / POCO Pad,
+> kernel `5.10.236-android12-9-00003-gfb24cf99ad97-ab14313284`) from scratch.
+> No prior kernel-exploitation background is required; just read the chapters in order.
 
-## 工作原理总览
+## How it works (overview)
 
 ```mermaid
 flowchart TD
-    subgraph 准备["准备阶段（电脑侧）"]
-        A["build.sh 编译 exploit<br/>(NDK 交叉编译 arm64)"] --> B["adb 推送 ghostlock 二进制<br/>+ profile.bin 到平板"]
+    subgraph PREP["Preparation (host side)"]
+        A["build.sh compiles the exploit<br/>(NDK cross-compile to arm64)"] --> B["adb pushes the ghostlock binary<br/>+ profile.bin to the tablet"]
     end
 
-    subgraph W1["W1：关闭 SELinux"]
-        C["fork 大量子进程喷 mm_struct<br/>占满目标物理页所在 slab"] --> D["释放目标页 → unix socket<br/>sendmsg skb 数据精确回收该页<br/>(payload 页 = 伪造锁/任务)"]
-        D --> E["pselect6 在 waiter 线程内核栈<br/>覆写已释放的 rt_mutex_waiter"]
-        E --> F["sched_setattr 触发 PI 链调整<br/>rb_erase 重链接 = 受控内核写"]
-        F --> G["selinux_enforcing := 0<br/>(SELinux 进入 Permissive)"]
+    subgraph W1["W1: disable SELinux"]
+        C["fork many children to spray mm_struct<br/>and fill the slab holding the target page"] --> D["free the target page, then reclaim it precisely<br/>with unix socket sendmsg skb data<br/>(payload page = forged lock/task)"]
+        D --> E["pselect6 on the waiter thread's kernel stack<br/>overwrites the freed rt_mutex_waiter"]
+        E --> F["sched_setattr triggers the PI chain adjustment<br/>rb_erase relink = controlled kernel write"]
+        F --> G["selinux_enforcing := 0<br/>(SELinux goes Permissive)"]
     end
 
-    subgraph W2["W2：覆写凭据（新进程，干净堆）"]
-        H["fork victim 子进程<br/>perf_event 泄漏其 task_struct 地址"] --> I["同样的页回收 + 栈覆写 + PI 链"]
-        I --> J["child-&gt;cred := init_cred<br/>(uid/gid/能力 = 0/全套)"]
-        J --> K["fast repair：修复 init_cred+8<br/>副写损伤（5.x 必需）"]
-        K --> L["child 管道应答 uid=0<br/>= Root 验证通过"]
+    subgraph W2["W2: overwrite credentials (new process, clean heap)"]
+        H["fork the victim child<br/>perf_event leaks its task_struct address"] --> I["same page reclaim + stack overwrite + PI chain"]
+        I --> J["child-&gt;cred := init_cred<br/>(uid/gid/capabilities = 0/full)"]
+        J --> K["fast repair: fix the collateral damage<br/>at init_cred+8 (required on 5.x)"]
+        K --> L["the child answers over the pipe with uid=0<br/>= root verified"]
     end
 
-    subgraph 落地["Root 落地"]
-        M["root 脚本以 uid=0 运行<br/>修复 SELinux policy 标志位"] --> N["从 KernelSU 管理器 APK<br/>提取 ksud"]
-        N --> O["ksud late-load<br/>kernelsu.ko 内核模块"]
-        O --> P["KernelSU 激活（越狱模式）<br/>SELinux 恢复 Enforcing"]
+    subgraph LAND["Landing root"]
+        M["the root script runs as uid=0<br/>and repairs the SELinux policy flag"] --> N["extract ksud from the<br/>KernelSU manager APK"]
+        N --> O["ksud late-load<br/>the kernelsu.ko kernel module"]
+        O --> P["KernelSU active (jailbreak mode)<br/>SELinux back to Enforcing"]
     end
 
     B --> C
-    G -->|"进程退出释放现场<br/>(两段式，避免脏堆)"| H
+    G -->|"process exit releases the scene<br/>(two-stage, avoids a dirty heap)"| H
     L --> M
-    P --> Q["/data/adb 持久保存模块与授权<br/>重启后重跑 reroot.sh 即恢复"]
+    P --> Q["/data/adb keeps modules and grants<br/>rerun reroot.sh after a reboot to restore"]
 
     style W1 fill:#fff4e0
     style W2 fill:#e0f0ff
-    style 落地 fill:#e8ffe0
+    style LAND fill:#e8ffe0
 ```
 
 ---
 
-## 目录
+## Contents
 
-- [第一章 背景知识速成](#第一章-背景知识速成)
-- [第二章 漏洞原理：CVE-2026-43499](#第二章-漏洞原理cve-2026-43499)
-- [第三章 从漏洞到任意内核写](#第三章-从漏洞到任意内核写)
-- [第四章 dizi 适配的五个关键参数](#第四章-dizi-适配的五个关键参数)
-- [第五章 完整复现教程](#第五章-完整复现教程)
-- [第六章 Root 脚本全文与逐段讲解](#第六章-root-脚本全文与逐段讲解)
-- [第七章 排障与 FAQ](#第七章-排障与-faq)
-- [附录](#附录)
-
----
-
-## 第一章 背景知识速成
-
-### 1.1 内核漏洞利用在做什么
-
-应用程序运行在「用户态」，权限受限；内核运行在「内核态」，掌握一切。
-**提权（Root）= 让内核承认我们的进程是 root（uid=0）**。
-
-每个进程在内核里都有一个 `task_struct`（任务档案），其中 `cred` 指针指向
-「凭据」结构（uid、gid、capabilities 等）。`getuid()` 就是读
-`current->cred->uid`。**如果能把这个指针改成指向 `init_cred`（内核初始
-凭据，uid=0、全套能力），进程立刻变成 root**——这就是本方案的 W2。
-
-但 SELinux 会拦截提权后的敏感操作，所以先要把 SELinux 打成
-Permissive（只记录不拦截）——这是 W1：把内核变量 `selinux_enforcing`
-改写为 0。
-
-### 1.2 futex 与 PI（优先级继承）
-
-futex 是 Linux 的线程锁原语。带 PI 的 futex（`FUTEX_LOCK_PI`）用于解决
-优先级反转：低优先级线程持有锁、高优先级线程等待时，内核会**临时提升**
-持锁线程的优先级。
-
-内核里负责这件事的是 `rt_mutex`（实时互斥锁）。等待锁的线程会挂一个
-`rt_mutex_waiter` 结构到锁的红黑树（rb-tree）里，按优先级排序。调整
-优先级时，内核沿「等待链」逐级传播（`rt_mutex_adjust_prio_chain`），
-过程中会对红黑树做插入/删除（`rb_insert_color`/`rb_erase`）。
-
-### 1.3 内核堆与页回收
-
-内核对象（如 `task_struct`、`mm_struct`）从 slab/slub 分配器里分配。
-一个物理页（4KB 或更大块）被切成若干相同大小的槽位。对象释放后槽位
-（或整页）进入空闲链表。
-
-**堆喷（heap spray）**：短时间大量分配同类对象，把空闲槽位占成我们想要的
-布局。**页回收（page reclaim）**：目标对象释放后，立刻用携带我们数据的
-别的内核对象（本方案用 unix socket 的发包缓冲 skb）去「接住」那块刚释放
-的物理页——之后内核再按原类型读这页，读到的就是我们的数据。这是漏洞
-利用的核心手法，也是本方案中**唯一带概率的环节**（回收可能接歪，约
-1/3~1/2 命中率）。
-
-### 1.4 内核栈复用
-
-每个线程在内核里有一小块内核栈（16KB），系统调用深、中断来时栈帧层层
-叠放。一个线程在 `futex_wait_requeue_pi` 里睡着时，它的 waiter 结构就在
-内核栈上。漏洞让 waiter 变成悬空指针（指向的栈帧已逻辑释放）。之后如果
-同一线程再执行一个**会在内核栈上放用户数据的系统调用**（`pselect6` 会把
-fd_set 位图拷贝到内核栈），新栈帧恰好覆盖旧 waiter 的内存——
-**我们就能往 waiter 结构里写字节**。这叫做栈戳记（stack stamping）。
+- [Chapter 1: Quick background](#chapter-1-quick-background)
+- [Chapter 2: The vulnerability CVE-2026-43499](#chapter-2-the-vulnerability-cve-2026-43499)
+- [Chapter 3: From vulnerability to arbitrary kernel write](#chapter-3-from-vulnerability-to-arbitrary-kernel-write)
+- [Chapter 4: The five key parameters of the dizi adaptation](#chapter-4-the-five-key-parameters-of-the-dizi-adaptation)
+- [Chapter 5: Full reproduction walkthrough](#chapter-5-full-reproduction-walkthrough)
+- [Chapter 6: The root script, line by line](#chapter-6-the-root-script-line-by-line)
+- [Chapter 7: Troubleshooting and FAQ](#chapter-7-troubleshooting-and-faq)
+- [Appendix](#appendix)
 
 ---
 
-## 第二章 漏洞原理：CVE-2026-43499
+## Chapter 1: Quick background
 
-### 2.1 漏洞本体
+### 1.1 What kernel exploitation actually does
 
-2011 年引入、2026 年修复（存在约 15 年），影响 `2.6.39` ~ `7.1-rc1` 所有
-开启 `CONFIG_FUTEX_PI` 的内核。上游修复 commit：`3bfdc63936dd`
-（"rtmutex: Use waiter::task instead of current in remove_waiter()"）。
+Applications run in "user mode" with limited privileges; the kernel runs in "kernel
+mode" and controls everything. **Privilege escalation (root) = making the kernel accept
+that our process is root (uid=0)**.
 
-`rt_mutex_start_proxy_lock()` 的回滚路径（由 `futex_requeue()` 触发）里，
-`remove_waiter()` **错误地对 `current`（当前线程）而不是 `waiter->task`
-（ waiter 所属线程）操作**：
+Every process has a `task_struct` (its task record) in the kernel, and its `cred` pointer
+points at the credentials structure (uid, gid, capabilities, ...). `getuid()` simply reads
+`current->cred->uid`. **If that pointer can be changed to point at `init_cred` (the
+kernel's initial credentials: uid=0, full capabilities), the process instantly becomes
+root** — that is W2 in this project.
+
+SELinux, however, blocks sensitive operations after escalation, so SELinux must first be
+switched to Permissive (log only, no blocking) — that is W1: overwrite the kernel
+variable `selinux_enforcing` with 0.
+
+### 1.2 futex and PI (priority inheritance)
+
+A futex is Linux's thread-lock primitive. A PI futex (`FUTEX_LOCK_PI`) solves priority
+inversion: when a low-priority thread holds a lock and a high-priority thread waits for
+it, the kernel **temporarily raises** the holder's priority.
+
+The kernel object behind this is `rt_mutex` (a real-time mutex). A thread waiting for the
+lock attaches an `rt_mutex_waiter` structure to the lock's red-black tree, ordered by
+priority. When priorities are adjusted, the kernel propagates the change along the "wait
+chain" (`rt_mutex_adjust_prio_chain`), which inserts into and removes from the red-black
+tree (`rb_insert_color` / `rb_erase`).
+
+### 1.3 The kernel heap and page reclaim
+
+Kernel objects (such as `task_struct` and `mm_struct`) are allocated from the slab/slub
+allocator. A physical page (4 KB or a larger block) is split into slots of equal size.
+When an object is freed, its slot (or the whole page) goes onto a free list.
+
+**Heap spray**: allocate many objects of the same type in a short time so the free slots
+end up in the layout we want. **Page reclaim**: immediately after the target object is
+freed, "catch" that just-freed physical page with another kernel object carrying our data
+(this project uses unix socket send buffers, skb) — when the kernel later reads that page
+assuming the original type, it reads our data. This is the core technique of the exploit
+and the **only probabilistic step** in this project (the reclaim can land wrong; the hit
+rate is roughly 1/3–1/2).
+
+### 1.4 Kernel stack reuse
+
+Every thread has a small kernel stack (16 KB); system calls and interrupts stack frames
+on top of each other. While a thread sleeps inside `futex_wait_requeue_pi`, its waiter
+structure lives on its kernel stack. The vulnerability turns that waiter into a dangling
+pointer (the stack frame it lives in is logically released). If the same thread then makes
+a **system call that places user data on the kernel stack** (`pselect6` copies fd_set
+bitmaps onto the kernel stack), the new frame lands exactly on top of the old waiter —
+**so we can write bytes into the waiter structure**. This is called stack stamping.
+
+---
+
+## Chapter 2: The vulnerability CVE-2026-43499
+
+### 2.1 The bug itself
+
+Introduced in 2011, fixed in 2026 (about 15 years of exposure), affecting every kernel
+from `2.6.39` through `7.1-rc1` built with `CONFIG_FUTEX_PI`. Upstream fix commit:
+`3bfdc63936dd` ("rtmutex: Use waiter::task instead of current in remove_waiter()").
+
+On the rollback path of `rt_mutex_start_proxy_lock()` (triggered by `futex_requeue()`),
+`remove_waiter()` **operates on `current` (the running thread) instead of `waiter->task`
+(the thread that owns the waiter)**:
 
 ```c
-// 有漏洞的代码（5.10 语义示意）
+// vulnerable code (5.10 semantics, simplified)
 static void remove_waiter(struct rt_mutex_base *lock, struct rt_mutex_waiter *waiter)
 {
-    raw_spin_lock_irq(&current->pi_lock);      // ← 错！应为 waiter->task->pi_lock
-    rt_mutex_dequeue(lock, waiter);            // 把 waiter 从树里摘除
-    current->pi_blocked_on = NULL;             // ← 错！清的是当前线程
+    raw_spin_lock_irq(&current->pi_lock);      // ← wrong! should be waiter->task->pi_lock
+    rt_mutex_dequeue(lock, waiter);            // remove the waiter from the tree
+    current->pi_blocked_on = NULL;             // ← wrong! clears the running thread
     raw_spin_unlock_irq(&current->pi_lock);
     ...
 }
 ```
 
-后果：waiter 线程的 `pi_blocked_on` **没有被清**（悬空指针），且摘除操作
-没持正确的锁。waiter 线程随后醒来返回用户态，它内核栈上的 waiter 结构
-逻辑上已释放，但 PI 链里还挂着它的引用——**栈上的 UAF**。
+Consequences: the waiter thread's `pi_blocked_on` is **never cleared** (dangling
+pointer), and the dequeue happens without holding the correct lock. The waiter thread then
+wakes up and returns to user mode; the waiter structure on its kernel stack is logically
+released, but the PI chain still holds a reference to it — **a UAF on the stack**.
 
-### 2.2 触发时序
+### 2.2 Trigger sequence
 
 ```mermaid
 sequenceDiagram
-    participant M as main 线程
-    participant W as waiter 线程
-    participant C as consumer 线程
-    participant K as 内核
+    participant M as main thread
+    participant W as waiter thread
+    participant C as consumer thread
+    participant K as kernel
 
-    Note over M,C: 三个 futex 字构造 PI 等待环
-    W->>K: FUTEX_LOCK_PI（睡进 futex_wait_requeue_pi）<br/>waiter 在 W 的内核栈上
-    M->>K: FUTEX_CMP_REQUEUE_PI（制造回滚条件）
-    K->>K: remove_waiter 误清 current<br/>W 的 pi_blocked_on 残留悬空
-    Note over W,K: W 的内核栈帧逻辑释放，但 PI 链仍引用它
-    W->>K: pselect6（fd_set 拷贝到内核栈）<br/>精确覆写 waiter 结构体（stamp）
-    C->>K: sched_setattr(W, 修改 nice)<br/>触发 rt_mutex_adjust_prio_chain
-    K->>K: 沿 PI 链 walk 到被覆写的 waiter<br/>rb_erase 重链接 → 受控写任意内核地址
+    Note over M,C: three futex words build a PI wait ring
+    W->>K: FUTEX_LOCK_PI (sleeps in futex_wait_requeue_pi)<br/>the waiter lives on W's kernel stack
+    M->>K: FUTEX_CMP_REQUEUE_PI (creates the rollback condition)
+    K->>K: remove_waiter clears current by mistake<br/>W's pi_blocked_on stays dangling
+    Note over W,K: W's kernel stack frame is logically released but the PI chain still points at it
+    W->>K: pselect6 (copies fd_set onto the kernel stack)<br/>overwrites the waiter struct exactly (stamp)
+    C->>K: sched_setattr(W, change nice)<br/>triggers rt_mutex_adjust_prio_chain
+    K->>K: walks the PI chain to the overwritten waiter<br/>rb_erase relink -> controlled write to any kernel address
 ```
 
-**这个漏洞的妙处**：EDEADLK 回滚发生后**没有时间压力**——waiter 线程可以
-一直睡着，我们想什么时候 stamp、什么时候触发 walk 都行。难点只剩两个：
-把 waiter 内容写对（栈戳记），以及把 payload 页准备对（堆回收）。
+**What makes this bug convenient**: after the EDEADLK rollback there is **no time
+pressure** — the waiter thread can stay asleep indefinitely, so we can stamp and trigger
+the walk whenever we like. Only two hard parts remain: writing the waiter contents
+correctly (stack stamping) and preparing the payload page correctly (heap reclaim).
 
 ---
 
-## 第三章 从漏洞到任意内核写
+## Chapter 3: From vulnerability to arbitrary kernel write
 
-### 3.1 总链路
+### 3.1 The full chain
 
 ```mermaid
 flowchart LR
-    subgraph 用户态准备
-        A1["KernelSnitch 时序侧信道<br/>泄漏 mm_struct 地址<br/>（破 KASLR 堆基址）"]
-        A2["mm 喷+探针确定<br/>payload 页物理位置"]
-        A3["unix socket sendmsg<br/>skb 携带 payload 回收该页"]
+    subgraph USER["user-mode preparation"]
+        A1["KernelSnitch timing side channel<br/>leaks the mm_struct address<br/>(defeats KASLR heap base)"]
+        A2["mm spray + probes determine<br/>the payload page's physical position"]
+        A3["unix socket sendmsg<br/>skb carries the payload and reclaims that page"]
     end
-    subgraph 内核态触发
-        B1["waiter 栈帧 stamp<br/>（pselect6 fd_set）"]
-        B2["consumer sched_setattr<br/>触发链 walk"]
-        B3["rb_erase(伪造 waiter)<br/>= *(target) := value"]
+    subgraph KERN["kernel-mode trigger"]
+        B1["waiter stack-frame stamp<br/>(pselect6 fd_set)"]
+        B2["consumer sched_setattr<br/>triggers the chain walk"]
+        B3["rb_erase(forged waiter)<br/>= *(target) := value"]
     end
     A1 --> A2 --> A3 --> B1 --> B2 --> B3
 ```
 
-一次成功的写入需要三件事同时成立：
+A successful write requires three things at once:
 
-1. **payload 页回收命中**：被释放的 mm_struct 所在页被我们的 skb 数据
-   精确接住（页内偏移必须对齐——dizi 是 4KB 头 + order-3 整页 frag，
-   数据在页偏移 0，所以 `skb_frag_bias = 0x180`）；
-2. **栈戳记命中**：pselect6 的 fd_set 栈帧精确覆盖 waiter（dizi 无
-   `RANDOMIZE_KSTACK_OFFSET`——5.13 才引入——所以栈几何是确定的，
-   `waiter_shift = -2` 永久成立）；
-3. **walk 安全走完**：伪造的 fake_lock/fake_task 让
-   `rt_mutex_adjust_prio_chain` 一路走到 erase 我们的节点。
+1. **Payload page reclaimed**: the page holding the freed mm_struct is caught exactly by
+   our skb data (the in-page offset must line up — on dizi it is a 4 KB header plus an
+   order-3 whole-page frag with the data at page offset 0, hence
+   `skb_frag_bias = 0x180`);
+2. **Stack stamp lands**: the pselect6 fd_set stack frame covers the waiter exactly
+   (dizi has no `RANDOMIZE_KSTACK_OFFSET` — that arrived in 5.13 — so the stack geometry
+   is deterministic and `waiter_shift = -2` always holds);
+3. **The walk completes safely**: the forged fake_lock/fake_task lead
+   `rt_mutex_adjust_prio_chain` all the way to erasing our node.
 
-### 3.2 写原语的精确语义（5.10 select 路由）
+### 3.2 Exact write semantics (5.10 select route)
 
-伪造 waiter 的红黑树节点字段为 `{pc = 写入值, right = 0, left = 目标地址}`，
-节点标记为红色（不做颜色修正）。内核 `rb_erase` 该节点时：
+The forged waiter's red-black-tree node fields are `{pc = value_to_write, right = 0,
+left = target_address}` and the node is marked red (no color fix-up). When the kernel
+`rb_erase`s that node:
 
-- **主写**：`rb_set_parent_color(child=target, parent=pc&~3, color)`
-  → `*(target) = pc | color`，pc 低 2 位为 0 → 写值精确；
-- **副写**：`__rb_change_child` 把子节点地址写进父槽
-  → `*(pc+8) = target`。
+- **Primary write**: `rb_set_parent_color(child=target, parent=pc&~3, color)`
+  → `*(target) = pc | color`; the low 2 bits of pc are 0, so the value written is exact;
+- **Secondary write**: `__rb_change_child` stores the child address into the parent slot
+  → `*(pc+8) = target`.
 
-W2 时 pc = `init_cred` 别名地址，所以副写会把 child 的 cred 字段地址写进
-`init_cred+8`（gid 字段）——**这就是 5.x 上必须 fast repair 的原因**：
-W2 主写成功后立刻再发一发修复写，把 `init_cred+8` 清零。本项目的
-`w2_fast_repair` 就是为此从 multicast 路由移植到 select 路由的
-（`src/core/route/select_stack_route.cpp`，仅 `kernel_major==5` 时激活）。
+For W2, pc is the `init_cred` alias address, so the secondary write stores the child's
+cred field address at `init_cred+8` (the gid field) — **which is why 5.x needs fast
+repair**: as soon as W2's primary write succeeds, another repair write zeroes
+`init_cred+8`. That is what `w2_fast_repair` does in this project; it was ported from the
+multicast route to the select route (`src/core/route/select_stack_route.cpp`, active only
+when `kernel_major==5`).
 
-### 3.3 W1/W2/W3 三阶段
+### 3.3 The three stages W1/W2/W3
 
-| 阶段 | 目标 | 写入 | 验证 |
+| Stage | Target | Value written | Verification |
 |---|---|---|---|
-| W1 | `selinux_enforcing` | 0 | 读 `/sys/fs/selinux/enforce` |
-| W2 | victim 子进程 `task->cred` | `init_cred` 别名 | 管道问 child `getuid()`，应答 0 |
-| W3 | victim 的 seccomp | 清 TIF_SECCOMP + mode | fork 探针（shell 域无 seccomp，跳过） |
+| W1 | `selinux_enforcing` | 0 | read `/sys/fs/selinux/enforce` |
+| W2 | victim child `task->cred` | `init_cred` alias | ask the child for `getuid()` over the pipe; expect 0 |
+| W3 | victim's seccomp | clear TIF_SECCOMP + mode | fork probe (skipped: the shell domain has no seccomp) |
 
-W3 的叶子方向探测还有一段插曲：5.10 上 leaf 写入的 erase 分支与 6.x 不同，
-本项目修复了 leaf 盖字（`{fake_parent, 0, 0}`，对齐编码器契约）。
+There is also a story behind W3's leaf-direction probe: the erase branch for leaf writes
+on 5.10 differs from 6.x, and this project fixed the leaf overwrite
+(`{fake_parent, 0, 0}`, matching the encoder contract).
 
-### 3.4 两段式运行（为什么分两个进程）
+### 3.4 Two-stage run (why two processes)
 
-W1 成功后同一进程继续做 W2 时，内核堆已被几千次 fork/spray 搅动，W2 回收
-命中率骤降。所以项目加了 `--stop-after-w1`：W1 成功后进程干净退出（堆状态
-随进程释放），再跑一次新进程——W1 自动跳过（已 permissive），W2 在干净堆里
-进行。SELinux permissive 状态跨进程保持（直到重启）。
+If the same process continues with W2 after W1 succeeds, the kernel heap has already been
+churned by thousands of forks and sprays, and W2's reclaim hit rate collapses. The project
+therefore added `--stop-after-w1`: after W1 succeeds the process exits cleanly (the heap
+state is released with it) and a fresh process runs — W1 is skipped automatically (already
+permissive) and W2 proceeds on a clean heap. The SELinux permissive state survives across
+processes (until reboot).
 
-### 3.5 一个隐蔽的 fd 抢占 bug（已修复）
+### 3.5 A subtle fd-stealing bug (fixed)
 
-select 路由用 fd_set 位图戳记 waiter 数据：位图的每个 bit 对应一个 fd 号，
-路由对置位 fd 做 `dup2` 强占。W2 的 `pi_left = 目标地址`（内核指针），其低
-字节 bit 6/7 恰好常是 victim 管道的 fd 号 6/7——**路由会把自己的通信管道
-关掉**，child 读到 EOF 自杀，验证永远失败。修复：创建管道后立刻把 fd 抬到
-戳记窗口（320）之上（`src/core/session/victim_process.cpp`）。
+The select route stamps waiter data with fd_set bitmaps: each bit corresponds to an fd
+number, and the route `dup2`s over the fds whose bits are set. W2's `pi_left =
+target_address` (a kernel pointer), whose low byte bits 6/7 are often exactly the victim
+pipe's fds 6/7 — **so the route closed its own communication pipe**, the child read EOF
+and exited, and verification always failed. Fix: raise the pipe fds above the stamping
+window (320) right after creating them (`src/core/session/victim_process.cpp`).
 
 ---
 
-## 第四章 dizi 适配的五个关键参数
+## Chapter 4: The five key parameters of the dizi adaptation
 
-`profiles/5.10.236-....conf` 里每个值的来历（全部有真机或二进制证据）：
+Where every value in `profiles/5.10.236-....conf` comes from (all backed by device or
+binary evidence):
 
-| 参数 | 值 | 来历 |
+| Parameter | Value | Origin |
 |---|---|---|
-| `waiter_shift` | -2 | 两侧 syscall 链帧深字节级核算：futex 链（0x90+0x70+0x1a0，waiter@sp+0x90）vs pselect 链（0xa0+0x1c0，fd_set@sp+0x50），delta=0 → shift=-2 |
-| `mm_struct_sz` | 960 | dizi SLUB 是 64B cacheline：DWARF sizeof=952 → 实测 `/proc/slabinfo` objsize=960、34 obj/slab |
-| `skb_frag_bias` | 384 (0x180) | 5.10 的 unix sendmsg = 4KB kmalloc 头 + order-3 整页 frag，数据在页偏移 0；流字节 4096 即目标块开头 |
-| `skb_reclaim_sends` | 16 | 真机门禁实测：4 太少盖不满，128 过压反而更糟 |
-| 结构体偏移（task_struct/cred 等） | 见 conf | 同构建 GKI vmlinux 的 DWARF，再在 boot.img 上逐字节交叉验证（`init_task.comm="swapper"`、init_cred caps 段等） |
+| `waiter_shift` | -2 | byte-level frame accounting of both syscall chains: futex chain (0x90+0x70+0x1a0, waiter at sp+0x90) vs pselect chain (0xa0+0x1c0, fd_set at sp+0x50), delta=0 → shift=-2 |
+| `mm_struct_sz` | 960 | dizi SLUB uses 64-byte cachelines: DWARF sizeof=952, measured `/proc/slabinfo` objsize=960, 34 objs/slab |
+| `skb_frag_bias` | 384 (0x180) | 5.10 unix sendmsg = 4 KB kmalloc header + order-3 whole-page frag, data at page offset 0; stream byte 4096 is the start of the target block |
+| `skb_reclaim_sends` | 16 | measured on the device gate: 4 is too few to cover, 128 over-pressures and does worse |
+| struct offsets (task_struct/cred etc.) | see the conf | DWARF from the same-build GKI vmlinux, then byte-by-byte cross-checked on boot.img (`init_task.comm="swapper"`, the init_cred caps section, ...) |
 
-另外还有 `kernel_phys_load = 0xa8000000`（UEFI 内存图）与
-`kernel_phys_offset = null`（默认 0x80000000，与 root 后实测 `/proc/iomem`
-的 System RAM 起始吻合）。
+There are also `kernel_phys_load = 0xa8000000` (UEFI memory map) and
+`kernel_phys_offset = null` (defaults to 0x80000000, matching the start of System RAM
+observed in `/proc/iomem` after rooting).
+
+> The same derivation, run for the other supported build
+> `5.10.209-android12-9-00019-g4ea09a298bb4-ab12292661` (HyperOS 1.0.19.0.UNSCNXM), is in
+> `profiles/5.10.209-....conf`. Frames and offsets are **not** shared between builds:
+> `tools/reroot.sh` picks the profile from the device's `uname -r` and refuses to run when
+> that build has no profile.
 
 ---
 
-## 第五章 完整复现教程
+## Chapter 5: Full reproduction walkthrough
 
-### 5.1 环境准备（电脑侧）
+### 5.1 Environment setup (host side)
 
-macOS：
-
-```bash
-brew install --cask android-commandlinetools   # 含 adb
-brew install android-platform-tools            # 若上一步没带
-# NDK：用 Android Studio 的 SDK Manager 安装，或命令行：
-sdkmanager "ndk;29.0.14206865"                  # 任一较新版本即可
-```
-
-Linux：装 `android-tools`（adb）+ 从
-https://developer.android.com/ndk/downloads 下载 NDK 解压。
-
-验证：
+macOS:
 
 ```bash
-adb version            # 有输出即可
-echo $ANDROID_NDK_HOME # 或让 build.sh 自动探测
+brew install --cask android-commandlinetools   # includes adb
+brew install android-platform-tools            # if the step above did not include it
+# NDK: install through Android Studio's SDK Manager, or from the command line:
+sdkmanager "ndk;29.0.14206865"                  # any reasonably recent version works
 ```
 
-### 5.2 设备准备（平板侧）
+Linux: install `android-tools` (adb) and download + unpack the NDK from
+https://developer.android.com/ndk/downloads.
 
-1. 设置 → 关于平板 → 连点「OS 版本」开开发者选项；
-2. 开发者选项 → 开 **USB 调试**；
-3. 确认内核版本：关于平板 → 内核版本必须是
-   `5.10.236-android12-9-00003-gfb24cf99ad97-ab14313284`（不同版本不能用
-   本 profile）；
-4. 安装 KernelSU 管理器 APK（https://github.com/tiann/KernelSU/releases）。
-   **这步必须做**——Root 脚本要从它的安装包里提取 ksud 来加载内核模块；
-5. USB 连电脑，平板上允许调试授权。
+Verify:
 
-### 5.3 构建
+```bash
+adb version            # any output is fine
+echo $ANDROID_NDK_HOME # or let build.sh auto-detect it
+```
+
+### 5.2 Device setup (tablet side)
+
+1. Settings → About tablet → tap "OS version" repeatedly to enable developer options;
+2. Developer options → enable **USB debugging**;
+3. Confirm the kernel version: About tablet → Kernel version must be
+   `5.10.236-android12-9-00003-gfb24cf99ad97-ab14313284` (a different version cannot use
+   this profile);
+4. Install the KernelSU manager APK (https://github.com/tiann/KernelSU/releases).
+   **This step is mandatory** — the root script extracts ksud from that package to load
+   the kernel module;
+5. Connect the tablet to the computer over USB and accept the debugging authorization.
+
+### 5.3 Build
 
 ```bash
 git clone https://github.com/d16ug-a1l/REDMI_Root
@@ -295,63 +317,88 @@ cd REDMI_Root
 ./build.sh
 ```
 
-成功后会看到 `[+] 构建成功: build/native/ghostlock`。
+On success you will see `[+] build succeeded: build/native/ghostlock`.
 
-### 5.4 执行 Root
+### 5.4 Run the root
 
 ```bash
 tools/reroot.sh
 ```
 
-接下来是全自动的，**过程中平板可能自动重启几次——这是正常的**（堆回收未
-命中 → 内核 panic → 重启，脚本会等设备回来继续）。典型输出：
+From here everything is automatic. **The tablet may reboot several times — this is
+normal** (a missed heap reclaim panics the kernel and reboots; the script waits for the
+device to come back and continues). Typical output:
 
 ```
-== 第 1 次: W1 (SELinux) 10:00:01
-   W1 未命中（设备可能重启了，等待重连...）
-== 第 2 次: W1 (SELinux) 10:02:40
-   W1 成功 (permissive)
-== ROOTED + KernelSU 已激活（第 2 次第 1 次尝试）
+== attempt 1: W1 (SELinux) 10:00:01
+   W1 missed (the device may have rebooted; waiting for reconnect...)
+== attempt 2: W1 (SELinux) 10:02:40
+   W1 succeeded (permissive)
+== ROOTED + KernelSU active (attempt 2, try 1)
 ```
 
-看到 `ROOTED` 即完成。实测耗时几分钟到二十几分钟不等。
+You are done when you see `ROOTED`. Measured runtimes range from a few minutes to a bit
+over twenty minutes.
 
-### 5.5 验证
+### 5.5 Verify
 
 ```bash
 adb shell "su -c id"
 # uid=0(root) gid=0(root) groups=0(root) context=u:r:ksu:s0
 ```
 
-打开平板上的 KernelSU 管理器，应显示「工作中 [越狱模式]」。
+Open the KernelSU manager on the tablet; it should show "working [jailbreak mode]".
 
-### 5.6 之后每次重启
+### 5.6 Every reboot afterwards
 
-Root 是越狱模式（重启失效），但**模块和授权配置不会丢**。每次重启后只需：
+Root is jailbreak mode (lost on reboot), but **modules and grants are not lost**. After
+each reboot simply run:
 
 ```bash
 tools/reroot.sh
 ```
 
-建议安装的模块（可选）：NeoZygisk + Vector（Xposed 框架），在 KernelSU
-管理器的模块页安装 zip 即可。
+Suggested optional modules: NeoZygisk + Vector (Xposed framework); install their zips
+from the module page of the KernelSU manager.
 
 ---
 
-## 第六章 Root 脚本全文与逐段讲解
+## Chapter 6: The root script, line by line
 
-`tools/reroot.sh` 全文：
+The full `tools/reroot.sh`:
 
 ```bash
 #!/bin/bash
-# dizi 一键重 root：平板 USB 连接 Mac 后运行本脚本即可。
-# 自动完成：W1 (SELinux permissive) → W2 (cred root) → KernelSU 模块重载。
-# 之前的模块和授权配置会自动恢复。
-# 过程中平板可能重启若干次（属正常，USB 会自动重连），看到 ROOTED 即成。
+# dizi one-shot re-root: connect the tablet over USB and run this script.
+# It performs W1 (SELinux permissive) -> W2 (cred root) -> KernelSU module reload.
+# Previously installed modules and their authorization state are restored automatically.
+# The tablet may reboot several times during the run (normal; USB reconnects on its own).
+# You are done when you see ROOTED.
 cd "$(dirname "$0")/.." || exit 1
 
 BIN=build/native/ghostlock
-PROFILE="profiles/5.10.236-android12-9-00003-gfb24cf99ad97-ab14313284.bin"
+# Select the profile for the device's real kernel build before every push
+# (build-exact; never reuse a profile across builds).
+# PROFILE=... explicitly overrides the selection, but the file must exist.
+PROFILE="${PROFILE:-}"
+
+resolve_profile() {
+    if [ -n "$PROFILE" ]; then
+        [ -f "$PROFILE" ] || { echo "!! PROFILE does not exist: $PROFILE"; return 1; }
+        return 0
+    fi
+    local uname_r
+    uname_r=$(adb shell uname -r 2>/dev/null | tr -d '\r')
+    [ -z "$uname_r" ] && { echo "!! failed to read uname -r from the device"; return 1; }
+    PROFILE="profiles/${uname_r}.bin"
+    [ -f "$PROFILE" ] || {
+        echo "!! no profile for this kernel build: $uname_r"
+        echo "   expected file: $PROFILE"
+        echo "   (refusing to use a profile from another build)"
+        return 1
+    }
+    echo "== profile: $PROFILE"
+}
 
 wait_device() {
     while true; do
@@ -368,6 +415,8 @@ wait_device() {
 }
 
 push_all() {
+    resolve_profile || exit 1
+    [ -f "$BIN" ] || { echo "!! missing binary: $BIN (build it on the build machine and copy it back)"; exit 1; }
     adb push "$BIN" /data/local/tmp/ghostlock >/dev/null 2>&1
     adb push "$PROFILE" /data/local/tmp/profile.bin >/dev/null 2>&1
     adb shell chmod 755 /data/local/tmp/ghostlock 2>/dev/null
@@ -378,36 +427,36 @@ while true; do
     ATTEMPT=$((ATTEMPT+1))
     wait_device
 
-    # 已 root 则直接结束
+    # Already rooted: nothing to do
     if adb shell "su -c id" 2>/dev/null | grep -q "uid=0"; then
-        echo "== KernelSU 已激活，无需操作"
+        echo "== KernelSU already active, nothing to do"
         exit 0
     fi
 
     ENF=$(adb shell "cat /sys/fs/selinux/enforce" 2>/dev/null | tr -d '\r')
     if [ "$ENF" != "0" ]; then
-        # phase 1: W1 → permissive
-        echo "== 第 $ATTEMPT 次: W1 (SELinux) $(date '+%H:%M:%S')"
+        # phase 1: W1 -> permissive
+        echo "== attempt $ATTEMPT: W1 (SELinux) $(date '+%H:%M:%S')"
         push_all
         adb shell "cd /data/local/tmp && ./ghostlock --load-prebuilt-profile /data/local/tmp/profile.bin --stop-after-w1" > /dev/null 2>&1
         ENF=$(adb shell "cat /sys/fs/selinux/enforce" 2>/dev/null | tr -d '\r')
         if [ "$ENF" != "0" ]; then
-            echo "   W1 未命中（设备可能重启了，等待重连...）"
+            echo "   W1 missed (the device may have rebooted; waiting for reconnect...)"
             sleep 3
             continue
         fi
-        echo "   W1 成功 (permissive)"
+        echo "   W1 succeeded (permissive)"
     fi
 
-    # phase 2: W2 → root → KernelSU 重载（permissive boot 内反复试）
+    # phase 2: W2 -> root -> KernelSU reload (retry inside the permissive boot)
     for i in $(seq 1 25); do
         wait_device
         ENF=$(adb shell "cat /sys/fs/selinux/enforce" 2>/dev/null | tr -d '\r')
-        [ "$ENF" != "0" ] && break   # 重启了，回 phase 1
+        [ "$ENF" != "0" ] && break   # rebooted; back to phase 1
         push_all
         adb shell "cd /data/local/tmp && ./ghostlock --load-prebuilt-profile /data/local/tmp/profile.bin" > /dev/null 2>&1
         if adb shell "su -c id" 2>/dev/null | grep -q "uid=0"; then
-            echo "== ROOTED + KernelSU 已激活（第 $ATTEMPT 次第 $i 次尝试）"
+            echo "== ROOTED + KernelSU active (attempt $ATTEMPT, try $i)"
             exit 0
         fi
         sleep 2
@@ -415,69 +464,73 @@ while true; do
 done
 ```
 
-逐段讲解：
+Section by section:
 
-| 行 | 作用 |
+| Part | Purpose |
 |---|---|
-| `wait_device` | 等平板在线且开机完成；顺手清理 offline 的 adb 端点（防多设备歧义卡死） |
-| `push_all` | 把 exploit 二进制和 profile 推到 `/data/local/tmp`（每次推，保证新鲜） |
-| `su -c id` 预检 | 已 root 就直接退出（脚本幂等，可随便重复跑） |
-| 段 1 | 读 `/sys/fs/selinux/enforce`，非 0 则跑 `--stop-after-w1`（只做 W1 就退出）；W1 未命中会 panic 重启，`wait_device` 自动等回来 |
-| 段 2 | permissive 状态下连跑完整 exploit 最多 25 次：W1 自动跳过 → W2 → root 脚本 → ksud 加载 KernelSU；静默 miss 零成本重试，只有 panic 才丢 permissive 回段 1 |
+| `resolve_profile` | reads `uname -r` from the device and selects `profiles/<release>.bin`; aborts instead of silently reusing another build's profile |
+| `wait_device` | waits until the tablet is online and boot has completed; also clears offline adb endpoints (prevents multi-device ambiguity from wedging the script) |
+| `push_all` | pushes the exploit binary and profile to `/data/local/tmp` (every time, so the device always has the current build) |
+| `su -c id` pre-check | exits immediately if already rooted (the script is idempotent and safe to rerun) |
+| stage 1 | reads `/sys/fs/selinux/enforce`; if non-zero, runs `--stop-after-w1` (do W1 then exit); a miss panics and reboots, and `wait_device` waits for the device to return |
+| stage 2 | while permissive, runs the complete exploit up to 25 times: W1 skipped → W2 → root script → ksud loads KernelSU; a silent miss retries at no cost, and only a panic loses permissive state and returns to stage 1 |
 
 ---
 
-## 第七章 排障与 FAQ
+## Chapter 7: Troubleshooting and FAQ
 
-**Q：一直 `W1 未命中` 转圈？**
-正常概率事件，放着就行（命中率约 1/3~1/2，脚本无限重试）。超过 30 分钟
-没成功，先 `Ctrl+C`，确认平板内核版本与 profile 完全一致，再重跑。
+**Q: It keeps looping on `W1 missed`?**
+That is a normal probabilistic event; leave it running (hit rate about 1/3–1/2, the
+script retries indefinitely). If nothing succeeds after 30 minutes, press `Ctrl+C`,
+confirm the tablet's kernel version matches the profile exactly, and start again.
 
-**Q：adb 显示多个设备/offline？**
-脚本已自动清理 offline 端点。如果还卡，手动 `adb devices` 检查，
-`adb disconnect <ip:端口>` 清掉残留。
+**Q: adb shows multiple devices or offline?**
+The script already clears offline endpoints. If it is still stuck, run `adb devices`
+manually and clear leftovers with `adb disconnect <ip:port>`.
 
-**Q：root 成功后平板变卡/某 App 崩？**
-罕见。重启平板即回到完全未 root 的干净状态（不刷写任何分区）。
+**Q: The tablet is slow or an app crashes after rooting?**
+Rare. Rebooting returns the tablet to a completely unrooted, clean state (no partition is
+ever written).
 
-**Q：想彻底移除？**
-KernelSU 管理器 → 卸载/移除模块；重启；删除 `/data/adb`（可选）。
-没有任何分区被修改，boot 镜像原样。
+**Q: How do I remove it completely?**
+KernelSU manager → uninstall/remove modules; reboot; optionally delete `/data/adb`.
+No partition has been modified and the boot image is untouched.
 
-**Q：能用于别的机型吗？**
-不能直接通用——profile 是按内核精确版本匹配的。其他机型需要用上游
-ghostlock-app 的提取器重新生成 profile 并真机验证（过程见
-`docs/adaptation-plan.md`，那就是本方案的完整适配实录）。
+**Q: Can it be used on other models?**
+Not directly — a profile is matched to an exact kernel version. Other models need a new
+profile generated with the upstream ghostlock-app extractor and validated on real
+hardware (the process is documented in `docs/adaptation-plan.md`, the full record of this
+adaptation).
 
-**Q：会损坏保修/触发 Knox 类熔断吗？**
-不熔断（不解 BL、不刷分区）。但 MIUI 可能记录到设备异常重启日志。
+**Q: Does it void the warranty / trigger Knox-style fuses?**
+No fuses are blown (no bootloader unlock, no partition flashing). MIUI may, however,
+record abnormal reboots in its logs.
 
 ---
 
-## 附录
+## Appendix
 
-### 关键源码索引
+### Key source index
 
-| 文件 | 内容 |
+| File | Contents |
 |---|---|
-| `src/core/main.cpp` | 入口（`--stop-after-w1`、`--probe-comm-write` 等开关） |
-| `src/core/session/backend/cve_2026_43499_backend.cpp` | W1/W2/W3 阶段机、fast repair 调用点 |
-| `src/core/route/select_stack_route.cpp` | select 路由：fd_set 戳记、5.x fast repair 钩子 |
-| `src/core/race/threads.cpp` | owner/waiter/consumer 三线程竞态 |
-| `src/core/support/util.cpp` | mm 喷 + skb 回收（`prepare_kernel_page`） |
-| `src/core/session/victim_process.cpp` | victim 协议、fd 抬升修复 |
-| `profiles/*.conf` | 全部几何/偏移参数及出处注释 |
+| `src/core/main.cpp` | entry point (`--stop-after-w1`, `--probe-comm-write`, ...) |
+| `src/core/session/backend/cve_2026_43499_backend.cpp` | W1/W2/W3 stage machine, fast-repair call sites |
+| `src/core/route/select_stack_route.cpp` | select route: fd_set stamping, 5.x fast-repair hook |
+| `src/core/race/threads.cpp` | owner/waiter/consumer three-thread race |
+| `src/core/support/util.cpp` | mm spray + skb reclaim (`prepare_kernel_page`) |
+| `src/core/session/victim_process.cpp` | victim protocol, fd-raising fix |
+| `profiles/*.conf` | all geometry/offset parameters with provenance notes |
 
-### 参考资料
+### References
 
-- 上游项目：https://github.com/YuKongA/ghostlock-app
-- 漏洞修复 commit：`3bfdc63936dd4773109b7b8c280c0f3b5ae7d349`
-  （torvalds/linux，"rtmutex: Use waiter::task instead of current in
-  remove_waiter()"）
-- 本机型门禁证据：`docs/device-gate-DIZI-01.md`
-- 适配全程设计与决策记录：`docs/adaptation-plan.md`
+- Upstream project: https://github.com/YuKongA/ghostlock-app
+- Fix commit: `3bfdc63936dd4773109b7b8c280c0f3b5ae7d349`
+  (torvalds/linux, "rtmutex: Use waiter::task instead of current in remove_waiter()")
+- Device-gate evidence for this model: `docs/device-gate-DIZI-01.md`
+- Full adaptation design and decision record: `docs/adaptation-plan.md`
 
-### 法律与合规
+### Legal and compliance
 
-使用本工具前必须阅读项目根目录的 [DISCLAIMER.md](../DISCLAIMER.md)。
-仅限本人自有设备与授权场景。
+Read [DISCLAIMER.md](../DISCLAIMER.md) in the repository root before using this tool.
+Use it only on devices you own and in authorized scenarios.
