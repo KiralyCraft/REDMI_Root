@@ -404,6 +404,127 @@ sent to it) and `e5778c5b` (target). `SERIAL=e5778c5b tools/reroot.sh --check` o
 change on the tablet. Waiting for explicit authorization for the gate run (expect reboots; a miss
 panics the kernel).
 
+### 2026-10-28 — Gate run 1 (5.10.209): W1 + W2 pass, KernelSU was missing, harness hang
+
+Authorized gate run of the new profile on `e5778c5b`. Results, in order:
+
+1. **W1 passed on the first attempt** (21:35:34). `/sys/fs/selinux/enforce` went to 0 and stayed 0
+   for the rest of the session (no panic, no reboot at any point).
+2. **W2 passed too**: the root script ran as `uid=0 euid=0` with `Seccomp: 0`, the SELinux policy
+   fixup worked (`policyload before=0 after=2`, `policy fixup rc=0`), and `/proc/iomem` was cached
+   (11258 B). The victim child was parked (`ghostleaf_01234` in `rt_sigsuspend`, i.e. the deliberate
+   `pause()` parking after a successful cred overwrite).
+3. **Root still failed** because **no KernelSU manager was installed**: the root script reported
+   `ksud=/data/adb/ksu/bin/ksud`, `ksud_file=` (empty) and `[!] ksud missing; cannot late-load`,
+   then exited 1. With the handoff aborted, the parked child was never signalled (`root_child_frontend`
+   tears it down only at the late-load teardown), so it kept the adb shell's stdout open and
+   `reroot.sh` blocked forever on that iteration. That is the "stuck on attempt 1, no reboot"
+   symptom: it was not a stalled exploit, the exploit had already succeeded through W2.
+4. **`kernel_phys_load` is now confirmed**, not inferred: the cached `/proc/iomem` shows
+   `a8000000-aa47ffff : Kernel code` (and `808f4000-808fffff : System RAM` first), so
+   `kernel_phys_load = 0xa8000000` with `kernel_phys_offset = null` (default 0x80000000) is correct
+   for this build. `skb_reclaim_sends` / `skb_frag_bias` remain unconfirmed until a full pass.
+
+Remediation before the next attempt (no profile change):
+
+- Installed KernelSU v3.3.1 (`KernelSU_v3.3.1_32680-release.apk`, package `me.weishu.kernelsu`) and
+  pushed its `lib/arm64-v8a/libksud.so` to `/data/local/tmp/ksud` (mode 755) as the root script's
+  fallback ksud. v3.3.1 embeds the `android12-5.10_kernelsu.ko` LKM, which is the KMI this kernel
+  reports (`android12-5.10`).
+- Hardened `tools/reroot.sh`: per-try progress lines, a 240 s bound on every exploit invocation, and
+  stray-process reaping (`ghostlock`, `ghostleaf`) before/after each attempt. The child parking is by
+  design, so the harness — not the exploit — has to cope with a failed handoff.
+
+### 2026-10-28 — Gate runs 3–5 (authorized, instrumented driver; in progress)
+
+Post-remediation runs after installing KernelSU + pushing ksud (all on `e5778c5b` only):
+
+- **Run 3** (22:39–22:46, `tools/reroot.sh`, log `/tmp/opencode/gate-209-run3-223947.log`): 6 attempts,
+  W1 hit 1/6, one W2 try, panics.
+- **Run 4** (22:48–22:52, instrumented driver): 4 attempts, 0/4 W1 hits — panics during the race.
+- **Run 5** (22:53+, instrumented driver with full stdout capture, log `/tmp/opencode/gate-209-run5.log`):
+  W1 hit rate ≈ 4/21; ~10 W2 tries, **zero landings**: the route reports `success=1` (race hit bookkeeping)
+  but `verify_w2_stage` always reads `child uid = 2000` → "W2 failed after 1 rounds". Collision screens
+  show 11/7–14/7 (expected 7), consistent with the carried `skb_reclaim_sends=16`/`skb_frag_bias=384`
+  geometry mismatching the fresh-boot heap state — but **not falsified**: Run 1 landed once with the same
+  profile, so these values may be heap-state dependent rather than wrong.
+- **Key discriminator**: `/data/local/tmp/.ghostlock_ksu.log` mtime is still 21:57 device-clock — Run 1's
+  pre-push execution. No post-push W2 landing has ever executed the root script, so `[!] ksud missing` in
+  the log is a stale artifact; the post-push handoff (`late-load kmi=android12-5.10`) remains untested.
+  ksud itself is confirmed present and `-x` from the shell domain (`/data/local/tmp/ksud`).
+- Repeated panics mid-race (~10 reboots across runs); `kernel_phys_load` p0 values self-confirm at
+  runtime on every attempt (`delta=0x28000000`, anchors match the profile).
+
+Loop continues until root or until the signature stops being informative.
+
+### 2026-10-28 — Bootloader (XBL/ABL) hunt: the ABL volume *does* decode, and the unlock path is enumerated
+
+Offline work only, from the OTA payload (`/bigdata/dizi_root/firmware/`, local working copies in
+`/tmp/opencode/ghidra/`). Nothing was read from the device for this.
+
+**Correction to the earlier "ABL payload is undecodable" note.** That was a framing error, not an
+encryption obstacle. The compressed FV data at LOAD-segment offset `0x78` is a plain
+LZMA-alone stream — props `0x5D` (lc=3, lp=0, pb=2), dict size `0x1000000`, declared unpacked size
+`0xE00C8` — and Python's `lzma` decodes it cleanly with `FORMAT_ALONE`. The result is a
+917,704-byte firmware volume (`/tmp/opencode/ghidra/abl_09fa00000_fv.bin`). `imagefv` also reports
+an LZMA-alone header but its output is almost all zeros with no modules in it, so it is not usable.
+
+What the decoded ABL volume contains:
+
+- One PE32 module, machine `0xAA64` (AArch64), entry RVA `0x1000`, name `LinuxLoader` in its entry
+  header (DataLength `0x9AA78`), followed by a large trailing data region (~290 KB) that holds the
+  string tables.
+- **Fastboot server command table**: `getvar:`, `flashing get_unlock_ability`, `oem unlock`,
+  `oem lock`, `oem device-info`, `oem allow-wipe-userdata`, `oem edl`, `oem erase-vb-index`,
+  `oem fbreason`, `oem uart-enable`, `oem getguid`.
+- **Token path**: `Error Locate MiToken Protocol: %r`, `Error Get Token Length: %r`,
+  `Token Length: %d`, `Error Get Token: %r`, `token`, `Token Verify Failed, Reboot the device`,
+  `Edl Token Verify Failed`.
+- **Unlock state writes**: `IsAllowUnlock is %d`, `Error Set Device Unlock: %r`,
+  `Failed to update the unlock status`, `Error Set Device UnlockCritical: %r`,
+  `Unable set the unlock value: %r`, `Unable set the unlock critical value: %r`,
+  `Device unlocked: %a`, `Device critical unlocked: %a`, `get_unlock_ability: %d`,
+  `the Unlock status is : %d`, `After Unlock user write, the stored_rollback_index is : %d`,
+  `VB Reset Device State error: %r`, `RwDeviceState Re…turned error: %r`.
+- **AVB / boot state**: `State: Unlocked, AvbSlotVerify returned %a, continue boot`,
+  `assert fail: ops->read_is_device_unlocked != NULL`,
+  `KeyMasterSetRotAndBootState: SetFuse (TZ_HLOS_IMG_TAMPER_FUSE)`,
+  `… (TZ_HLOS_TAMPER_NOTIFY_FUSE)`.
+
+Reading of this evidence (inferences, not device-verified):
+
+1. **The lock state is a value that ABL writes at runtime** (`Unable set the unlock value`,
+   `… the unlock critical value`, `Error Set Device Unlock`), and the fuses are a *separate*
+   mechanism (`SetFuse (TZ_HLOS_IMG_TAMPER_FUSE)` is the root-of-truth / tamper-notify fuse, not the
+   unlock flag). This matches the GBL observation that `is_unlocked` / `is_unlocked_critical` are
+   variables rather than fuses.
+2. **The unlock decision itself is still server-signed.** Token verification is delegated to
+   TrustZone (`SecFuseLib.c`, `computeAndVerifyECDSA failed`, `verifyECDSACertificate failed`); the
+   earlier `FUN_a702ad24` / `FUN_a702ae48` wrappers are thin SMC trampolines. So there is no
+   offline-forgery route visible in ABL — the RSA-2048 server signature remains the gate. What
+   ABL controls locally is only *where* the answer is stored and whether `IsAllowUnlock` permits it.
+3. **There is no EDK2 variable store on this build.** The EDK2 variable-store signature
+   (`0x5A5B6176`) is absent from `abl.img`, `imagefv.img`, `tz.img`, `xbl.img`, `xbl_config.img`,
+   and the payload partition list has no `efisp`/variable-store partition. So the GBL-style
+   "drop a UEFI app that sets the variable" trick has no variable store to write to on dizi; the
+   state must live in some QCOM-side store (RPMB / `RwDeviceState` blob / `featenabler` /
+   `qweslicstore`) — **which one is unconfirmed**.
+
+Blocker for reading the actual `oem unlock` handler: Ghidra imports these images as raw data (no
+section headers), and only the `LinuxLoader` PE disassembles (1,296 functions). The fastboot/MiToken
+strings sit past that module's raw data, so Ghidra reports no cross-references to them. To read the
+handler we need either a correct FV file-entry walk of the decoded volume, or a validated AArch64
+adrp/add reference scanner — the naive bit-field decode gives targets that disagree with Ghidra's
+own disassembly, so it must be calibrated before it can be trusted.
+
+Independent confirmation from `dev-zetta/xiaomi_redmi_pad_unlocker` (Redmi Pad SE, `xun`): the
+Qualcomm ABL argument-injection flaw (`fastboot oem set-gpu-preemption`, accepts
+`androidboot.selinux=permissive`) is confirmed working there, chained with the HyperOS
+`miui.mqsas.IMQSNative` binder service to run a command as UID 0 during that one permissive boot.
+That project explicitly does **not** bypass Mi Unlock's server authentication — it only bypasses the
+Community quota. For dizi the permissive-boot half is already covered by the kernel route, so the
+remaining barrier is the server signature plus the location of the lock flag.
+
 ## Open items / next actions
 
 1. ✅ On ResearchVM: `kernel/common` @ `4ea09a298bb4` fetched, clang-r416183b downloaded, vmlinux
@@ -418,6 +539,12 @@ panics the kernel).
    `skb_frag_bias`); panics/reboots expected; requires explicit user authorization.
 5. The new profile is derived and build-exact but **not gate-verified** — record a cold-boot PASS here
    before treating it as production-ready.
+6. ⏳ Bootloader vulnerability hunt. The ABL volume now decodes (LZMA-alone framing) and its
+   `oem unlock` / MiToken strings are recovered, but the handler code is not yet disassembled: either
+   walk the decoded volume's FV file entries correctly, or calibrate an AArch64 adrp/add reference
+   scanner against Ghidra's own disassembly before trusting it. Also open: which store holds dizi's
+   lock flag — there is no EDK2 variable store on this build, so a GBL-style "UEFI app sets the
+   variable" trick has nothing to write to.
 
 ## Constraints reminder
 

