@@ -20,9 +20,15 @@ authoritative history. Convention per AGENTS.md: read this before working in the
   After reboot, the correct tablet's bootloader still reports `Device unlocked: false` and
   `unlocked: no`. **Stopped before wiping.** Earlier claims that this writable blob alone is a
   concrete unlock path are superseded; the VB protocol's authoritative backing/storage behavior
-  remains unresolved. The tablet is responsive in bootloader fastboot, slot `a`, critical locked;
-  Android boot and the raw post-reboot `devinfo` bytes have not been rechecked. No firmware/GPT
-  flashing, userdata/metadata wipe, EDL entry or custom RAM boot was performed.
+  is not a direct raw-partition mapping. A diagnostic return to stock Android has since passed:
+  boot complete, slot `_a`, green/locked. The raw post-reboot `devinfo` bytes still await root
+  readback. No firmware/GPT flashing, userdata/metadata wipe, EDL entry or custom RAM boot was
+  performed.
+- **VB provider recovered offline:** exact OTA `VerifiedBootDxe` implements the GUID/callback
+  ABL uses. It chooses Keymaster/RPMB storage on the secure path (`0x202` read, `0x203` write),
+  with raw GPT `devinfo` as the non-secure/permitted fallback path. This explains why a writable
+  layout-matching partition alone cannot establish an unlock. Runtime readback/active UEFI
+  cross-check is pending; no secure-storage or additional unlock write has been attempted.
 - **Unlock side effects analysed (2026-10-29, read-only):** the `devinfo` write itself is low-risk
   (a corrupt magic re-inits from the TZ secure-state default, expected locked; a read/write failure
   is a boot-entry error). The skipped
@@ -924,6 +930,49 @@ Next safe investigation is to check post-reboot bytes and resolve VB-protocol ba
 identity; this requires a separately considered return to stock Android/root or offline analysis.
 Earlier journal entries are retained as history and superseded where they claim a proven unlock.
 
+### 2026-10-29 — Diagnostic stock boot succeeds; VB provider recovered offline
+
+The user authorized diagnosis of whether reboot restored the byte or ABL uses another store.
+Rebooted `e5778c5b` from fastboot to stock Android; `sys.boot_completed=1`, same firmware/kernel,
+slot `_a`, `ro.boot.flash.locked=1`, verified boot `green`. Thus Android boot after the failed
+attempt is now verified. The `ghostsu` client reports its temporary agent is absent, as expected
+after reboot. Started the previously authorized temporary-root gate to regain read access; no
+new unlock/partition write or wipe is part of this diagnostic. Gate result/readback pending at
+this entry's creation. The protected second device is not targeted.
+
+**The missing provider was found offline.** Copied the already-downloaded exact OTA `uefi.img`
+from ResearchVM (`/bigdata/dizi_root/firmware/`) to ignored `.dizi-dumps/uefi.ota.img`. The UEFI
+container is not opaque: its GUID-defined sections at `0x52e80` / `0x1a6108` are **gzip**, not
+LZMA (GUID `1d301fe9-be79-4353-91c2-d23bc959ae0c`, data offset `0x18`). The first decoded volume
+contains FFS `a25f5839-4d55-428f-8f0b-5ce1d565f53e`, UI `VerifiedBootDxe`, PE payload 61,440 bytes.
+Exact extraction coordinates and SHA-256s are in `docs/bootloader-unlock-DIZI.md` §4.4.
+
+Ghidra `/dizi-bootloader/VerifiedBootDxe.efi`:
+
+- `FUN_000027d8` installs GUID **`8e5eff91-21b6-47d3-af2b-c15a01e020ec`**, exactly the GUID ABL
+  locates in `FUN_00030ad8`. Protocol table `0xd180`, offset `+8`, points to **`FUN_000015ac`**.
+- `FUN_000015ac` reads security state through `FUN_0000390c` (mask `0x8703`). The secure branch
+  calls QSEECom app **`keymaster`**, reading 4096 bytes via request **`0x202`**; its write path
+  read/modifies the secure buffer and sends **`0x203`**. Success logs **`Succeed using rpmb!`**.
+- The raw GPT **`devinfo`** partition is the alternative store (`FUN_00002878` /
+  `FUN_00002a24`). Non-secure state selects it directly. If a secure-app request fails, fallback
+  is gated by `FUN_000038a0` (mask `0x8723`); a fully secure state refuses fallback. Raw-store
+  success logs **`Succeed using devinfo!`**.
+
+This supplies the previously missing mechanism for the failed edit: the layout-matching raw
+partition need not be the authoritative secure-store blob. Runtime partition persistence and the
+active UEFI payload still need cross-checking. Do not infer a new authorized write path from the
+private Keymaster command IDs; no `0x203`, raw RPMB/provisioning operation, critical unlock or wipe
+has been attempted in this diagnostic.
+
+**Offline cross-check:** the pre-attempt on-device `abl_a` dump is 1,048,576 bytes; its first
+204,800 bytes hash to `7b54a8fcc41428328487de5848fcc512dd8bd4f4a38f765c8ebedccae9f50c65`,
+exactly matching the OTA `abl.img`. All remaining bytes are zero. Thus an ABL payload mismatch is
+not supported by the available dump. A static assertion check also passed for the OTA UEFI hash,
+gzip/FFS extraction, module identity, matching protocol GUID and `+8` callback pointer. Saved
+Ghidra plate comments at provider addresses `0x15ac`, `0x390c`, `0x38a0` documenting the store
+selection and the unconfirmed mask-bit semantics.
+
 ## Open items / next actions
 
 1. ✅ On ResearchVM: `kernel/common` @ `4ea09a298bb4` fetched, clang-r416183b downloaded, vmlinux
@@ -941,10 +990,11 @@ Earlier journal entries are retained as history and superseded where they claim 
    consecutive cold-boot pass is still open before calling it production-ready.
 6. ❌/⏳ The authorized ordinary-only `devinfo` edit **failed to unlock after reboot** despite
    complete pre-reboot write/readback verification. Tablet remains responsive in bootloader
-   fastboot, ordinary and critical locked; no wipe or firmware/GPT flash performed. Determine
-   whether the byte persisted and resolve the authoritative VB-protocol store before proposing
+   fastboot initially; diagnostic stock Android boot now also passes, green/locked. No wipe or
+   firmware/GPT flash performed. The exact VB provider has now been recovered: secure Keymaster/
+   RPMB versus raw `devinfo` fallback. Check byte persistence and active UEFI before proposing
    another write. The earlier "concrete unlock path" conclusion is superseded, not confirmed.
-   Details in the execution entry above and `docs/bootloader-unlock-DIZI.md` §1.1.
+   Details in the execution/diagnostic entries and `docs/bootloader-unlock-DIZI.md` §§1.1, 4.4.
 7. ⏳ Optional kernel-module root. Signatures are off (`CONFIG_MODULE_SIG` not set) but the device
    kernel is `CONFIG_CFI_CLANG=y` + `CONFIG_LTO_CLANG_FULL=y`, while the VM oracle tree is
    `LTO_NONE`/no CFI. A compatible `.ko` needs a CFI+LTO rebuild of that tree (or a loader for an

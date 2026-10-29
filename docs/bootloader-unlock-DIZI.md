@@ -16,8 +16,10 @@ GPT #58 on LUN 4) contains an `ANDROID-BOOT!` blob matching ABL's device-info la
 use offsets 13/14 of its in-memory blob, loaded through the VB protocol. Root can write the block
 partition, but this alone does **not** prove that the VB protocol uses those partition bytes as
 its authoritative state: an authorized `devinfo[13]=1`, `[14]=0` write was fully verified before
-reboot, yet fastboot reported locked. The backing-store relationship or another state condition
-needs investigation. There is currently **no device-verified tokenless unlock**.
+reboot, yet fastboot reported locked. The subsequently recovered `VerifiedBootDxe` provider (§4.4)
+has a secure Keymaster/RPMB backend distinct from the raw-partition fallback; runtime persistence
+and active UEFI cross-checks remain pending. There is currently **no device-verified tokenless
+unlock**.
 
 ### 1.1 Actual execution result (2026-10-29)
 
@@ -33,7 +35,8 @@ With explicit user authorization and acceptance of residual risk:
   `is-userspace: no`, `Device unlocked: false`, `Device critical unlocked: false`, `unlocked: no`,
   `current-slot: a`, and `snapshot-update-status: none`.
 - **Stopped:** no userdata wipe, metadata erase, firmware/GPT flash, EDL entry, custom RAM boot or
-  subsequent reboot. Tablet remains responsive in fastboot. Android boot has not been rechecked.
+  further reboot during that attempt. A later authorized diagnostic return to stock Android
+  succeeded (`sys.boot_completed=1`, green/locked, slot `_a`); the tablet is no longer in fastboot.
 
 Backups/logs are in ignored directory `.dizi-dumps/unlock-preflight-20261029-094508/`. Raw `devinfo`
 bytes after reboot have not been read, so persistence versus overwrite/mirror behavior remains
@@ -133,6 +136,53 @@ The full fastboot command table at `0xb7f80` was enumerated (`flash:`, `erase:`,
 `flashing get_unlock_ability`, `oem unlock`, `oem lock`, charger/display/device-info/poweroff/
 fbreason/uart/getguid/edl/erase-vb-index/log commands, `getvar:`, `download:`, …). No locked-state
 command writes `devinfo` or bypasses the token; `oem unlock` is the only token path.
+
+### 4.4 Missing layer found: `VerifiedBootDxe` chooses RPMB or the partition
+
+Offline follow-up on 2026-10-29 recovered the actual VB-protocol provider from the exact OTA's
+`uefi.img`, rather than assuming its implementation from ABL's wrapper.
+
+**Extraction/provenance:** the outer firmware volume begins at file offset `0x1000`. Its FFS
+GUID-defined sections at `0x52e80` and `0x1a6108` use gzip GUID
+`1d301fe9-be79-4353-91c2-d23bc959ae0c`, data offset `0x18`. Decoding the first yields 4,005,896
+bytes with a nested FV at offset 8. In that volume, FFS file
+`a25f5839-4d55-428f-8f0b-5ce1d565f53e` at `0x777f8` has UI name `VerifiedBootDxe`; its PE32 section
+at `0x77818` contains a 61,440-byte image. Local/Ghidra paths are
+`.dizi-dumps/VerifiedBootDxe.efi` and `/dizi-bootloader/VerifiedBootDxe.efi`.
+
+| image | SHA-256 |
+| --- | --- |
+| exact OTA `uefi.img` (4,202,496 bytes) | `6cd080f94cf26fb635b41e45d279cc31539b663c4d7eb8112d5a388056c96e55` |
+| extracted `VerifiedBootDxe.efi` | `89adb17817c374a94af54cb3557b624bf5129944fe8cc277836a63769c951567` |
+
+The pre-attempt `abl_a` device dump's first 204,800 bytes also match the OTA `abl.img` exactly
+(SHA-256 `7b54a8fcc41428328487de5848fcc512dd8bd4f4a38f765c8ebedccae9f50c65`); the remainder of
+that 1 MiB partition dump is zero. This rules out an ABL payload mismatch in the available dump.
+
+**Protocol linkage is exact:** ABL's `FUN_00030ad8` locates GUID
+`8e5eff91-21b6-47d3-af2b-c15a01e020ec` and calls protocol offset `+8`. The extracted driver's
+`FUN_000027d8` installs that same GUID with table `0xd180`, whose `+8` callback is
+`FUN_000015ac` (`RWDeviceState`).
+
+That callback implements two stores:
+
+1. Read secure state using `FUN_0000390c` (SCM security-state mask `0x8703`). In the secure
+   branch, locate QSEECom and obtain/start the **`keymaster`** app. The read request is command
+   **`0x202`**, with a 4096-byte buffer. Successful reads copy this buffer into ABL's device-info
+   object. Writes first read with `0x202`, update the supplied bytes, then send **`0x203`**.
+   This path explicitly logs **`VB: RWDeviceState: Succeed using rpmb!`**.
+2. In the non-secure branch, access the GPT partition labelled **`devinfo`** using
+   `FUN_00002878` (`read_partition`) / `FUN_00002a24` (`write_partition`). A failed secure-app
+   request can fall back to this store only if another security-state check (`FUN_000038a0`,
+   mask `0x8723`) permits it; otherwise the callback returns an error. This path logs
+   **`VB: RWDeviceState: Succeed using devinfo!`**.
+
+Therefore the matching raw-partition layout and its writability do **not** establish that it is
+authoritative on a secure, RPMB-provisioned tablet. The secure-store branch provides a concrete
+explanation for an ignored partition edit. The live post-reboot partition contents and the active
+UEFI image still need to be cross-checked before claiming which branch this tablet used. No
+Keymaster `0x203`, raw RPMB operation, provisioning change or additional unlock write is authorized
+by this diagnostic finding.
 
 ## 5. Writability proof (non-destructive)
 
