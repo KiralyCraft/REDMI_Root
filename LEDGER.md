@@ -29,6 +29,16 @@ authoritative history. Convention per AGENTS.md: read this before working in the
   with raw GPT `devinfo` as the non-secure/permitted fallback path. This explains why a writable
   layout-matching partition alone cannot establish an unlock. Runtime readback/active UEFI
   cross-check is pending; no secure-storage or additional unlock write has been attempted.
+- **Fallback is not forceable (2026-10-29):** the store selector is
+  `(scm_fuse_state & 0x8703) == 0` and the `devinfo` fallback additionally requires bit `0x20`
+  set (`0x8723` mask). Both inputs come from the read-only SCM SIP call `0x2000604`; no partition,
+  EFI variable or property feeds them. Corrupting the blob magic merely re-derives a locked state
+  from TZ. The only supported path is Xiaomi's MiToken-verified `oem unlock`, which sets ordinary
+  **and** critical unlock and wipes. Bit `0x20` semantics are unconfirmed.
+  `docs/bootloader-unlock-DIZI.md` §4.5.
+- **Latest gate run did not root:** the 2026-10-29 diagnostic `reroot.sh` run timed out (12
+  attempts, W1 ok, W2 never landed), so the tablet is booted stock, green/locked, unrooted, and the
+  post-reboot `devinfo` readback remains outstanding.
 - **Unlock side effects analysed (2026-10-29, read-only):** the `devinfo` write itself is low-risk
   (a corrupt magic re-inits from the TZ secure-state default, expected locked; a read/write failure
   is a boot-entry error). The skipped
@@ -973,6 +983,58 @@ gzip/FFS extraction, module identity, matching protocol GUID and `+8` callback p
 Ghidra plate comments at provider addresses `0x15ac`, `0x390c`, `0x38a0` documenting the store
 selection and the unconfirmed mask-bit semantics.
 
+### 2026-10-29 — Fallback predicate resolved offline; unlock is not forceable
+
+Read-only analysis + one authorized diagnostic gate run. No partition write, wipe, unlock write,
+critical unlock, EDL entry or RAM boot was performed. The protected second device was not touched.
+
+**Gate/diagnostic run:** a `tools/reroot.sh` run against `e5778c5b` (12 attempts, ~15 min) ended at
+the 900 s timeout with `exit 124` and **no root**: W1 (SELinux permissive) succeeded on most
+attempts, but W2 (cred overwrite) never landed. The tablet was left booted in stock Android,
+`sys.boot_completed=1`, `ro.boot.flash.locked=1`, `verifiedbootstate=green`, shell uid 2000. So the
+post-reboot `devinfo` readback is **still not obtained**; it needs a successful gate run, not a new
+write. A cached-rederivation question is open on why run 6 passed and this run did not.
+
+**The full chain from fuse state to the fastboot answer is now reconstructed**
+(`docs/bootloader-unlock-DIZI.md` §4.5):
+
+- Store selector `VerifiedBootDxe: FUN_0000390c` → Keymaster/RPMB store iff
+  `(scm_state & 0x8703) == 0`; otherwise the raw `devinfo` GPT partition. The
+  `VB: Non-secure device` log line belongs to the *raw* branch, i.e. to unfused/dev units.
+- Fallback gate `FUN_000038a0` → a failed Keymaster read may use `devinfo` only if
+  `(scm_state & 0x8723) != 0`. Since `0x8723 = 0x8703 | 0x20`, an RPMB-store device can reach the
+  fallback **only when bit `0x20` is set**. Bit semantics remain **unconfirmed**.
+- `scm_state` is read once via SCM SIP call **`0x2000604`** in `FUN_000037e4` and is fuse-derived.
+  No partition, EFI variable, `misc` byte or Android property participates. There is therefore no
+  writable input that can flip the branch.
+
+**Why the 2026-10-29 write was ignored (now explained without a device read):** the observed outcome
+requires that the raw branch was not taken, so this tablet reads its device info from the RPMB store
+and treats the byte-identical `devinfo` partition as a legacy mirror. Consistent with
+`secure`/`green`/fused retail configuration.
+
+**Caching and writers:** `LinuxLoaderEntry` → `FUN_000493a0` performs the single
+`RWDeviceState(0, …)` read of 0x998 bytes into `0xd1538`; `DAT_000c04e0` is statically `1` in the
+image and is the lazy-load guard. `FUN_000486d8`/`FUN_000486e8` only return cached bytes 13/14. The
+sole post-load writers are the magic-mismatch re-init and `FUN_00048e10`/`FUN_00048ee8`. The
+magic-mismatch path is a **re-lock**: it clears the blob, re-derives
+`is_unlocked = is_unlock_critical = (FUN_00031870() == 0)` from TZ, and writes back — so zeroing the
+store can never produce an unlock.
+
+**Only supported unlock path on this build:** `oem unlock` = `FUN_0005db28`, which resolves the
+**MiToken protocol**, reads and verifies the token, reboots on
+`Token Verify Failed`, and on success calls `FUN_00048908(0,1)` + `FUN_00048908(1,1)` (both ordinary
+**and** critical) then stages the `misc` master clear. `oem lock` = `FUN_0005dd78` requires unlocked.
+
+**Also established:** the VB protocol table `0xd180` is `{version, RWDeviceState(+8)=0x15ac,
+…, Reset_State(+0x30)=0x1c44, …}`; `FUN_000319a0` calls `Reset_State` after a successful state change
+and at boot, guarded by `FUN_0000b3e0`/`FUN_0000b3d8`. The exact UEFI image's own BDS menu text
+confirms RPMB is provisioned with a TZ-derived key, that the key changes once fuses are blown, and
+that re-provisioning a provisioned RPMB **bricks the device**.
+
+Conclusion recorded: there is **no tokenless unlock** to pursue on this unit short of a secure-world
+compromise, which is out of scope and carries EDL-only recovery risk.
+
 ## Open items / next actions
 
 1. ✅ On ResearchVM: `kernel/common` @ `4ea09a298bb4` fetched, clang-r416183b downloaded, vmlinux
@@ -991,10 +1053,12 @@ selection and the unconfirmed mask-bit semantics.
 6. ❌/⏳ The authorized ordinary-only `devinfo` edit **failed to unlock after reboot** despite
    complete pre-reboot write/readback verification. Tablet remains responsive in bootloader
    fastboot initially; diagnostic stock Android boot now also passes, green/locked. No wipe or
-   firmware/GPT flash performed. The exact VB provider has now been recovered: secure Keymaster/
-   RPMB versus raw `devinfo` fallback. Check byte persistence and active UEFI before proposing
-   another write. The earlier "concrete unlock path" conclusion is superseded, not confirmed.
-   Details in the execution/diagnostic entries and `docs/bootloader-unlock-DIZI.md` §§1.1, 4.4.
+   firmware/GPT flash performed. Root cause now established offline: the selector/fallback
+   predicates read fuse-derived SCM state, this unit uses the Keymaster/RPMB store, and no writable
+   input can force the raw `devinfo` branch. **Do not repeat the byte write.** The earlier
+   "concrete unlock path" conclusion is superseded, not confirmed. If unlock is still wanted, the
+   only supported route is Xiaomi's MiToken `oem unlock` with its mandatory wipe. Details in the
+   execution/diagnostic entries and `docs/bootloader-unlock-DIZI.md` §§1.1, 4.4, 4.5.
 7. ⏳ Optional kernel-module root. Signatures are off (`CONFIG_MODULE_SIG` not set) but the device
    kernel is `CONFIG_CFI_CLANG=y` + `CONFIG_LTO_CLANG_FULL=y`, while the VM oracle tree is
    `LTO_NONE`/no CFI. A compatible `.ko` needs a CFI+LTO rebuild of that tree (or a loader for an

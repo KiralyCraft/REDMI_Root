@@ -184,6 +184,76 @@ UEFI image still need to be cross-checked before claiming which branch this tabl
 Keymaster `0x203`, raw RPMB operation, provisioning change or additional unlock write is authorized
 by this diagnostic finding.
 
+### 4.5 Exact fallback predicate, unlock read path, and why it cannot be forced
+
+Follow-up offline analysis (2026-10-29, no device writes) reconstructed the complete decision chain
+from SCM fuse state to the fastboot answer, and established that the fallback is **not a
+configuration choice**.
+
+**The selector and the fallback are two different checks on the same SCM value.**
+
+| Check | Function | Predicate | Effect |
+| --- | --- | --- | --- |
+| Store selector | `FUN_0000390c` | `(state & 0x8703) == 0` → `local_b0 = 1` | `1` = Keymaster/RPMB store; `0` = raw `devinfo` |
+| Fallback gate | `FUN_000038a0` | `(state & 0x8723) != 0` | only then may a failed Keymaster read use `devinfo` |
+
+`state` comes from `FUN_000037e4`, which issues SCM SIP call **`0x2000604`** through the SCM
+protocol and requires `ret==0 && status==1`. It is a read-only secure-world value derived from
+fuses and boot configuration. Nothing in `devinfo`, `misc`, `frp`, the GPT, or Android userspace
+feeds into it.
+
+Because `0x8723 = 0x8703 | 0x20`, the two predicates together mean: a device that selects the RPMB
+store (`0x8703` clear) can reach the `devinfo` fallback **only if bit `0x20` is set**. The exact
+meaning of bit `0x20` is **not established** from the available images and is recorded as
+unconfirmed; the mask semantics above come from the decompiled comparisons, not from a QTI header.
+
+**Read path and caching.** `LinuxLoaderEntry` (`FUN_0000135c`, `0x1984`) calls `FUN_000493a0`
+before anything else. That function issues one `RWDeviceState` read (`FUN_00030ad8(0, buf, 0x998)`)
+into the BSS blob at `0xd1538`. The 0x998 bytes are then never re-read: `DAT_000c04e0` is
+statically initialised to `1` in the image, and `FUN_000493a0` is the only writer that clears it.
+`FUN_000486d8`/`FUN_000486e8` simply return cached bytes `+13`/`+14`.
+
+**Only two writers can change the cached flags after load**, besides the load itself:
+
+- the magic-mismatch re-initialisation inside `FUN_000493a0`; and
+- `FUN_00048e10` / `FUN_00048ee8`, the ordinary/critical setters behind `oem unlock` / `oem lock`.
+
+The magic-mismatch path is a **re-lock**, not a bypass: it zeroes the 0x998 bytes, restores the
+13-byte magic, reads SCM device state through `FUN_00031870`, sets
+`is_unlocked = is_unlock_critical = (state == 0)`, and writes the blob back through
+`FUN_00030ad8(1, …)`. Corrupting the magic therefore regenerates a *locked* blob on a locked
+device and never yields an unlock.
+
+**Why the 2026-10-29 write was ignored.** For the observed outcome (a verified, byte-identical
+partition write that fastboot nevertheless reported as locked) the raw-store branch must not have
+been taken, so `(state & 0x8703) != 0` does not hold: this tablet read its state from the
+Keymaster/RPMB store and treated `devinfo` as a legacy mirror. This is consistent with the device
+reporting `secure`, `verifiedbootstate=green` and a fused retail configuration. The
+`Non-secure device` log line belongs to the raw-`devinfo` branch, i.e. to unfused/dev units.
+
+**Can the fallback be forced?** Not from any writable surface:
+
+1. The predicate inputs are SCM fuse state. No partition, EFI variable, `misc` byte or Android
+   property is consulted, so there is nothing to edit.
+2. Making the Keymaster read fail on purpose is likewise not controllable: the alternative branch
+   exists for secure-app failure, and the fallback is still gated by bit `0x20`. Inducing a TA
+   failure would first break the secure store the device needs.
+3. Patching `VerifiedBootDxe` (or any UEFI/ABL module) to skip the check breaks the signed chain
+   rooted in XBL/PBL fuses; the device then does not boot normally.
+4. RPMB cannot be rewritten out of band. The BDS menu text in the exact UEFI image states the store
+   is provisioned with a TZ-derived key, that the key changes once fuses are blown, and that
+   re-provisioning an already provisioned RPMB **bricks the device**.
+
+**The only supported unlock path on this build** is Xiaomi's token flow, confirmed in ABL:
+`oem unlock` (`FUN_0005db28`) locates the **MiToken protocol**, reads the token, verifies it, and on
+failure prints `Token Verify Failed, Reboot the device` and reboots. On success it calls
+`FUN_00048908(0,1)` then `FUN_00048908(1,1)` — setting **both** ordinary and critical unlock — and
+stages a `misc` master clear (`recovery --wipe_data --reason=MasterClearConfirm`). `oem lock`
+(`FUN_0005dd78`) requires the device to be unlocked already.
+
+Consequently there is no tokenless unlock to pursue on this unit without a secure-world
+compromise, which is out of scope for this investigation and carries an EDL-only recovery risk.
+
 ## 5. Writability proof (non-destructive)
 
 `/sys/block/sde/sde58/ro` is `0`; the node is `brw------- root root`. The blob ends at `0x998`, so
