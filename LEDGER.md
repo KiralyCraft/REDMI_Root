@@ -3,7 +3,7 @@
 Append dated entries. Summaries at the top reflect the latest state; the journal below is the
 authoritative history. Convention per AGENTS.md: read this before working in the repo.
 
-## State summary (2026-10-28)
+## State summary (2026-10-29)
 
 - Target device confirmed; second device quarantined.
 - Target kernel is **vulnerable** to CVE-2026-43499 (verified at the exact build commit, source level,
@@ -11,12 +11,15 @@ authoritative history. Convention per AGENTS.md: read this before working in the
 - Build-exact profile for the target build **derived offline and written**
   (`profiles/5.10.209-…-ab12292661.{bin,conf}`): every symbol value comes from the device's own Image
   (kallsyms decode + three pointer-chase anchors), route geometry from the device's own bytes.
-- Exploit binary now **built** on the remote machine, copied to `build/native/ghostlock`, and
-  cross-checked against the source tree.
-- Run prepared but **not executed**: `tools/reroot.sh --check` passes read-only preflight on the
-  tablet; no push and no exploit execution has happened.
-- Remaining gaps: device gate run (needs explicit authorization) to confirm the empirical fields
-  (`kernel_phys_load`, `skb_reclaim_sends`, `skb_frag_bias`) and end-to-end success.
+- Exploit binary **built** (`build/native/ghostlock`) and **gate run 6 PASS** (2026-10-29): temporary
+  uid-0 root on `dizi` via the userspace `ghostsu` agent (no KernelSU), SELinux permissive until
+  reboot. Empirical fields (`kernel_phys_load`, `skb_reclaim_sends`, `skb_frag_bias`) remain
+  unconfirmed; a second cold-boot pass is still open.
+- **Bootloader unlock storage located (2026-10-29):** the `ANDROID-BOOT!` device-info blob lives in
+  `devinfo` (`/dev/block/sde58`, 4096 B). Byte 13 = `is_unlocked`, byte 14 = `unlock_critical`;
+  ABL checks only the 13-byte magic (no signature/CRC), and the partition is writable from Android
+  root. Writing those bytes is the concrete unlock path; it has **not** been executed (user
+  directive). Details in the 2026-10-29 entry and `docs/bootloader-unlock-DIZI.md`.
 
 ## Journal
 
@@ -662,6 +665,109 @@ CapEff: 000001ffffffffff
 
 **Status: the stated goal (a temporary root shell from adb, no bootloader unlock) is met.**
 
+### 2026-10-29 — Bootloader unlock storage found: `devinfo` is magic-only trusted
+
+Using the live run-6 root, partitions were dumped read-only and the ABL image re-read. The unlock
+gate is **not** `frp`; it is two unauthenticated bytes in the `devinfo` partition.
+
+**Location and layout.** `devinfo` = `/dev/block/by-name/devinfo` → `/dev/block/sde58`
+(GPT #58 on LUN 4, one 4096-byte logical block, first/last LBA 478862, type GUID
+`65addcf4-0c5c-4d9a-ac2d-d90b5cbfcd03`). The partition is the persisted 0x998-byte
+`ANDROID-BOOT!` device-info blob used by ABL:
+
+| offset | field |
+| --- | --- |
+| 0x000 | `"ANDROID-BOOT!"` (13 bytes, the only integrity check) |
+| 0x00d (13) | `is_unlocked` (currently `0x00`) |
+| 0x00e (14) | `is_unlock_critical` (currently `0x00`) |
+| 0x00f (15) | charger-screen flag (currently `0x00`) |
+| 0x090 (144) | init marker, currently `0x01` |
+| 0x8a0 | init marker, currently `0x01` |
+
+**Read-only dumps and checksums** (host copies under `/tmp/opencode/dizi-dumps/`, not committed;
+each stream was cross-checked with an on-device `sha256sum` of the same block device):
+
+| partition | node | size | sha256 (prefix) | note |
+| --- | --- | --- | --- | --- |
+| `devinfo` | sde58 | 4096 | `a799fba7…` | magic at 0x0; [13]=[14]=0 |
+| `frp` | sda5 | 512 KiB | `1a462029…` | last byte `0x01` = OEM unlock allowed |
+| `misc` | sda3 | 1 MiB | `ca6dc3b6…` | only `0x8000..0x8004` = `02 b0 0a 74 56` |
+| `persist` | sda2 | 32 MiB | `f5c37693…` | no magic |
+| `uefivarstore` | sde67 | 512 KiB | `224fbd06…` | `PTBL` store; only standard EFI vars, no unlock var |
+| `vbmeta_a` | sde16 | 64 KiB | `d29eaaf9…` | `avbtool 1.2.0` |
+| `vbmeta_system_a` | sda7 | 64 KiB | `03f22ddd…` | — |
+
+**ABL code (Ghidra project `A3xxOpenCLLab`, program `/dizi-bootloader/abl_full.efi`, from the OTA):**
+
+- `FUN_000493a0` is the load/init routine. It is called from the boot entry `FUN_0000135c` at
+  `0x1454`, **before** the AVB call at `0x1c64`. It reads 0x998 B through the VB protocol; if the
+  13-byte magic matches, the struct is trusted as-is. On mismatch it zeroes the struct, writes the
+  magic, sets `is_unlocked = (secure_state == 0)` (secure state is 1 on this device → locked),
+  `is_unlock_critical = is_unlocked`, byte 0x90 = 1, and writes it back. **No CRC, signature or TZ
+  check is applied to the magically-valid blob.**
+- `FUN_00048e10(v)` writes offset 13; `FUN_00048ee8(v)` writes offset 14; both persist the full
+  0x998 B blob through `FUN_00030ad8(1, …)` (VB protocol `VBRwDevice`).
+- `FUN_0005db28` (`fastboot oem unlock`, command table entry at `0xb7fd0`) verifies a MiToken
+  through a MiToken protocol (TZ) and, on success, calls `FUN_00048908(0,1)` then `(1,1)` → sets
+  offsets 13 and 14 to 1. `FUN_00048908` also writes a `boot-recovery` message to `misc`
+  (`--wipe_data` or `--just_exit`, depending on `allow-wipe-userdata`); that wipe request is a side
+  effect, not part of the lock state.
+- `FUN_0005dd78` (`fastboot oem lock`) requires `is_unlocked`, then calls `FUN_00048908(0,0)` and
+  `(1,0)` → clears offsets 13/14. This is the mirror image of the unlock path and proves those bytes
+  are the state.
+- The same bytes gate the rest of the bootloader: AVB (`FUN_0000b3e8`; at `0xc3f0` a failed
+  `LoadImageAndAuth` only continues when `is_unlocked`; boot state string `orange`), flash
+  (`FUN_0005c27c`: "Flashing is not allowed in Lock State", critical partitions need byte 14),
+  erase (`FUN_0005d680`: "Erase is not allowed in Lock State"), EDL (`FUN_0005e9f4`), rollback
+  index (`FUN_0000ef34` writes it instead of failing when unlocked). `FUN_000486d8`/`FUN_000486e8`
+  are the getters for bytes 13/14.
+- The complete fastboot command table (`0xb7f80`) was enumerated: `flash:`, `erase:`, `set_active`,
+  `flashing get_unlock_ability`, `oem unlock`, `oem lock`, charger-screen, display-panel,
+  `oem device-info`, `oem poweroff`, `oem fbreason`, `oem uart-enable`, `oem getguid`, `continue`,
+  `reboot`, `oem edl`, `oem erase-vb-index`, `oem lkmsg/lpmsg/uefilog`, recovery/fastboot/bootloader
+  reboots, `snapshot-update`, `getvar:`, `download:`, `oem allow-wipe-userdata`. No locked-state
+  command writes `devinfo` or bypasses the MiToken; the flash/erase handlers all check 13/14.
+
+**Device state:** `ro.boot.flash.locked=1`, `ro.boot.verifiedbootstate=green`,
+`ro.boot.vbmeta.device_state=locked`, `sys.oem_unlock_allowed=1`, `ro.oem_unlock_supported=1`.
+`frp`'s last byte is `0x01`, so the "OEM unlocking" developer-option gate is already open.
+
+**Writability (non-destructive proof):** `/sys/block/sde/sde58/ro` = 0 and the node is
+`brw------- root root`. A 4-byte **nonzero** pattern (`de ad be ef`) written into the unused
+padding at 0xF00 (the blob ends at 0x998) read back byte-identical, and was then restored to
+zeros; the partition hash returned to `a799fba7…`. A later 4-byte no-op zeros write also returned
+`rc=0`. The partition is neither block-layer read-only nor XPU-protected on this build.
+
+**Concrete unlock (identified; deliberately not executed).** From the live root:
+
+```sh
+dd if=/dev/block/by-name/devinfo of=/data/local/tmp/devinfo.bin bs=4096 count=1
+printf '\001' | dd of=/data/local/tmp/devinfo.bin bs=1 seek=13 conv=notrunc
+printf '\001' | dd of=/data/local/tmp/devinfo.bin bs=1 seek=14 conv=notrunc
+dd if=/data/local/tmp/devinfo.bin of=/dev/block/by-name/devinfo bs=4096 count=1 conv=notrunc
+sync
+# verify: dd if=/dev/block/by-name/devinfo bs=1 skip=13 count=2 | od -An -tx1   → 01 01
+adb reboot bootloader
+```
+
+Then `fastboot oem device-info` should report "Device unlocked: true" and "Device critical
+unlocked: true", `fastboot flashing get_unlock_ability` → 1, `fastboot getvar unlocked` → yes.
+Re-lock with `fastboot oem lock` (only with stock images; it clears 13/14 and writes the `misc`
+message), or write the bytes back to 0 from root.
+
+**Why this is the real unlock, not a guess:** the official token path and the official lock command
+use exactly these setters; the boot/AVB/flash/erase/EDL/rollback paths read exactly these bytes;
+the load path checks only the magic; the partition is writable from root; no other partition holds
+the magic; `frp` carries only the already-open allow flag; `uefivarstore` has no unlock variable.
+This is also the bootloader weakness itself: the persistent unlock state is unauthenticated, so any
+uid-0 (including the temporary kernel-exploit root) can flip it without the Xiaomi server token.
+
+**Caveats:** not executed (user directive). A corrupted blob re-initializes locked, so the failure
+mode is not a brick. The direct write skips the `--wipe_data`/`--just_exit` request of the official
+flow, so userdata is retained unless wiped manually. XBL still verifies ABL (secure boot), so a bad
+bootloader image can still brick; use stock images for critical partitions. OTA/rollback behavior
+after unlocking is untested.
+
 ## Open items / next actions
 
 1. ✅ On ResearchVM: `kernel/common` @ `4ea09a298bb4` fetched, clang-r416183b downloaded, vmlinux
@@ -677,13 +783,15 @@ CapEff: 000001ffffffffff
 5. The 5.10.209 profile passed its first cold-boot gate run on 2026-10-29 (run 6: W1 + W2,
    temporary root via `ghostsu`; entry above and `docs/device-gate-DIZI-02.md`). A **second**
    consecutive cold-boot pass is still open before calling it production-ready.
-6. ⏳ Bootloader vulnerability hunt. The ABL volume decodes (LZMA-alone framing) and the
-   `oem unlock` handler is now read: the unlock flag is an unauthenticated byte in the persisted
-   `ANDROID-BOOT!` device-info blob, so the server signature gates the command, not the storage.
-   Remaining work: (a) identify which partition holds the blob (`frp` is the candidate, unconfirmed),
-   (b) confirm on device read-only, (c) only then consider whether writing it is a real unlock path —
-   note there is no EDK2 variable store in these images, so the GBL-style "UEFI app sets the variable"
-   trick has nothing documented to write to on this build.
+6. ✅/⏳ Bootloader unlock path located. The blob is in **`devinfo`** (`sde58`), not `frp`; the unlock
+   state is bytes 13/14, ABL checks only the `ANDROID-BOOT!` magic, and the partition is writable
+   from Android root (nonzero write test passed and was restored). This is a real unlock path: the
+   token and lock handlers use the same setters, and AVB/flash/erase/EDL/rollback gate on the same
+   bytes. The UEFI variable store (`uefivarstore`, 512 KiB) contains only standard EFI variables —
+   no unlock variable — so the GBL-style "UEFI app sets the variable" trick does not apply. **Not
+   executed** per the user directive; executing and verifying the reboot is the remaining step
+   (controlled window; loses the temporary root). Details in the 2026-10-29 entry and
+   `docs/bootloader-unlock-DIZI.md`.
 7. ⏳ Optional kernel-module root. Signatures are off (`CONFIG_MODULE_SIG` not set) but the device
    kernel is `CONFIG_CFI_CLANG=y` + `CONFIG_LTO_CLANG_FULL=y`, while the VM oracle tree is
    `LTO_NONE`/no CFI. A compatible `.ko` needs a CFI+LTO rebuild of that tree (or a loader for an
