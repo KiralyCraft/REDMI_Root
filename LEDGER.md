@@ -575,6 +575,66 @@ That project explicitly does **not** bypass Mi Unlock's server authentication �
 Community quota. For dizi the permissive-boot half is already covered by the kernel route, so the
 remaining barrier is the server signature plus the location of the lock flag.
 
+### 2026-10-29 — Temporary adb root without KernelSU (userspace `ghostsu` agent)
+
+Run 5 proved the race lands (7 uid-0 executions, "child is root!"), and that the only
+failing step is the module handoff: `ksud late-load` exits 0 with no output and never
+loads anything on this kernel. Pivot: do not depend on KernelSU for the temporary root.
+
+**Verified on `dizi` (read-only), module-loading configuration** (`zcat /proc/config.gz`):
+
+| option | value | consequence |
+| --- | --- | --- |
+| `CONFIG_MODULES` | `y` | modules can be loaded at all |
+| `CONFIG_MODULE_SIG` | **not set** | unsigned modules are *not* rejected by signature |
+| `CONFIG_MODULE_FORCE_LOAD` | not set | `finit_module` honouring the force flag |
+| `CONFIG_MODVERSIONS` | `y` | CRC check; bypassable with `MODULE_INIT_IGNORE_MODVERSIONS` |
+| `CONFIG_CFI_CLANG` / `CONFIG_LTO_CLANG_FULL` | `y` / `y` | the kernel calls module code through CFI-instrumented indirect calls |
+| `CONFIG_CFI_PERMISSIVE` | not set | a CFI mismatch panics instead of warning |
+| `CONFIG_KPROBES`, `CONFIG_KALLSYMS_ALL` | `y`, `y` | KernelSU-style LKMs have their prerequisites |
+
+So the earlier "signature will block a custom .ko" concern is wrong — signatures are off.
+The real constraint is CFI: the VM oracle tree was built `CONFIG_LTO_NONE` and *without*
+`CONFIG_CFI_CLANG` (device vs VM `.config` differ only in the CFI/LTO block), so a module
+built from that tree has no CFI preamble and the loader's indirect call into
+`mod->init` would trap. A custom `.ko` therefore needs a CFI+LTO build, not attempted
+here; recorded as **unconfirmed** and left as an option.
+
+**Also verified:** `security_load_policy()` in the exact build tree
+(`security/selinux/ss/services.c`) never assigns `selinux_state.enforcing`, so the
+exploit's W1 permissive state survives the handoff script's policy reload. A userspace
+agent started at handoff therefore runs with SELinux permissive until reboot.
+
+**Implementation (this repo):**
+
+- `src/tools/ghostsu.cpp` — one small binary with two roles. `--agent` keeps the rooted
+  handoff's uid-0 authority alive and serves commands over the abstract unix socket
+  `ghostsu.v1`; the client runs `-c <cmd>` (framed stdout/stderr + exit status) or an
+  interactive pty shell; `--ping` probes liveness. The agent re-asserts `enforce=0` on
+  start and per request, sets `oom_score_adj=-1000`, and lives in its own session so it
+  outlives the exploit. Built as `build/native/ghostsu` (`make -C src ghostsu`).
+- `tools/ksud-agent-shim.sh` — pushed to `/data/local/tmp/ksud`. The rooted script
+  already executes that path as uid 0 (`ksud late-load --kmi ... --allow-shell`); the
+  shim starts the agent there and then chains to the real ksud saved as `ksud.real`.
+  No rebuild of the proven exploit binary was needed: `build/native/ghostlock` was
+  restored from the device and is byte-identical (sha256 `14cb155f…`).
+- `tools/reroot.sh` — pushes the agent, installs the shim (preserving a real ksud), and
+  treats `/data/local/tmp/su -c id` as the success criterion (`root_id`), falling back to
+  KernelSU's `su` if present.
+
+**Dry test on the device (unprivileged, no exploit):** the shim starts the agent,
+`ghostsu --ping` returns 0, and `/data/local/tmp/su -c id` returns the caller's identity
+through the socket (`uid=2000` in the unprivileged test, as expected). The interactive
+pty path was exercised on the host build (echo, command output, exit status).
+
+**Build note:** the local NDK 27 defines `PAGE_SIZE` as a macro and broke the exploit
+build; `src/core/kernel/constants.hpp` now `#undef`s it. The known-good binary was built
+with **NDK 29.0.14206865 on ResearchVM** (`/bigdata/android-sdk/ndk/29.0.14206865`, clang
+21.0.0) — use that toolchain for any exploit rebuild, to keep codegen comparable.
+
+**Gate run 6** (`/tmp/opencode/gate-209-agent-run6.log`) started 07:56 with the agent
+stack; result pending.
+
 ## Open items / next actions
 
 1. ✅ On ResearchVM: `kernel/common` @ `4ea09a298bb4` fetched, clang-r416183b downloaded, vmlinux
@@ -596,6 +656,12 @@ remaining barrier is the server signature plus the location of the lock flag.
    (b) confirm on device read-only, (c) only then consider whether writing it is a real unlock path —
    note there is no EDK2 variable store in these images, so the GBL-style "UEFI app sets the variable"
    trick has nothing documented to write to on this build.
+7. ⏳ Optional kernel-module root. Signatures are off (`CONFIG_MODULE_SIG` not set) but the device
+   kernel is `CONFIG_CFI_CLANG=y` + `CONFIG_LTO_CLANG_FULL=y`, while the VM oracle tree is
+   `LTO_NONE`/no CFI. A compatible `.ko` needs a CFI+LTO rebuild of that tree (or a loader for an
+   existing CFI-built LKM such as the extracted `android12-5.10_kernelsu.ko`) plus
+   `finit_module(fd, "", IGNORE_VERMAGIC|IGNORE_MODVERSIONS)`. Not attempted; the userspace
+   `ghostsu` agent covers the temporary-root goal first.
 
 ## Constraints reminder
 

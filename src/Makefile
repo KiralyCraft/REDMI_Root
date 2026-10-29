@@ -80,12 +80,18 @@ HOST_BUILD_DIR := $(BUILD_ROOT)/host-test
 
 # Every generated artifact stays under build/ so nothing lands in the repo root.
 GHOSTLOCK_BIN := $(NATIVE_BUILD_DIR)/ghostlock
+# Userspace temporary-root agent/client (see src/tools/ghostsu.cpp). It is a
+# separate binary so the harness's stray reaping of .../ghostlock never kills
+# the agent that is supposed to outlive an attempt.
+GHOSTSU_BIN := $(NATIVE_BUILD_DIR)/ghostsu
 
-.PHONY: all ghostlock clean product
+.PHONY: all ghostlock ghostsu clean product
 
-all: ghostlock
+all: ghostlock ghostsu
 
 ghostlock: $(GHOSTLOCK_BIN)
+
+ghostsu: $(GHOSTSU_BIN)
 
 $(GHOSTLOCK_BIN): $(OBJS) Makefile
 	@echo "Using NDK compiler: $(NDK_CC)"
@@ -93,6 +99,12 @@ $(GHOSTLOCK_BIN): $(OBJS) Makefile
 	@echo "Target config: $(TARGET_CONFIG)"
 	@mkdir -p $(dir $@)
 	$(NDK_CXX) $(OBJS) $(LDFLAGS) -o $@
+
+$(GHOSTSU_BIN): tools/ghostsu.cpp Makefile
+	@echo "Using NDK C++ compiler: $(NDK_CXX)"
+	@mkdir -p $(dir $@)
+	$(NDK_CXX) -O2 -flto -Wall -Wextra -Wconversion -Wsign-conversion \
+	  -std=c++23 -fno-rtti tools/ghostsu.cpp $(LDFLAGS) -o $@
 
 $(NATIVE_BUILD_DIR)/%.o: %.c $(HDRS)
 	@mkdir -p $(dir $@)
@@ -286,10 +298,11 @@ $(HOST_BUILD_DIR)/victim_context_test: core/tests/victim_context_test.cpp core/s
 	@mkdir -p $(HOST_BUILD_DIR)
 	$(HOST_CXX) $(HOST_CXXFLAGS) -pthread -Icore core/tests/victim_context_test.cpp core/session/victim_context.cpp core/support/native_resource.cpp -o $@
 
-product: ghostlock
+product: ghostlock ghostsu
 	@echo "=== ghostlock binary ready: $(GHOSTLOCK_BIN) ==="
+	@echo "=== ghostsu binary ready: $(GHOSTSU_BIN) ==="
 	@echo "Build APK: .\gradlew.bat :app:assembleDebug"
 
 clean:
-	rm -f $(GHOSTLOCK_BIN) ghostlock
+	rm -f $(GHOSTLOCK_BIN) $(GHOSTSU_BIN) ghostlock ghostsu
 	rm -rf $(BUILD_ROOT)/native $(BUILD_ROOT)/host

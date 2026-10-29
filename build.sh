@@ -22,10 +22,12 @@ echo "[*] NDK: $ANDROID_NDK_HOME"
 export ANDROID_NDK_HOME
 
 # 2. Build
-make -C src ghostlock
+make -C src ghostlock ghostsu
 BIN=build/native/ghostlock
-if [ -f "$BIN" ]; then
+AGENT=build/native/ghostsu
+if [ -f "$BIN" ] && [ -f "$AGENT" ]; then
     echo "[+] build succeeded: $BIN"
+    echo "[+] agent/client built: $AGENT"
     echo "[*] next: enable USB debugging on the tablet, connect it, and run tools/reroot.sh"
 else
     echo "[!] build failed"

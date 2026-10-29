@@ -21,8 +21,9 @@ adapted and verified on real hardware.
     (Android 14). The profile was derived offline from that build's own kernel image
     (kallsyms + pointer-chase anchors + device-verified stack frames); it has **not**
     been through a device gate run yet, so no device-gate record exists for it.
-- Result: temporary root + KernelSU (jailbreak mode / LKM; no bootloader unlock, no boot
-  image modification)
+- Result: temporary root until reboot (a userspace `su` channel backed by the rooted
+  handoff; no bootloader unlock, no boot image modification, no kernel module required).
+  KernelSU is still attempted when a manager is installed, but it is not needed.
 - Device gate: two consecutive cold-boot end-to-end passes (record in
   `docs/device-gate-DIZI-01.md`)
 
@@ -38,8 +39,19 @@ The kernel's `remove_waiter()` operates on the wrong task during the PI-futex ro
 path (CVE-2026-43499). The tool reuses a pselect stack frame to forge an
 `rt_mutex_waiter` and triggers a controlled kernel write while the PI chain is being
 re-prioritized: **W1** turns SELinux off, **W2** overwrites the child process's `cred`
-with `init_cred` (uid 0), then **W3** loads the KernelSU kernel module. Everything is a
-pure data write; control flow protected by CFI is never touched.
+with `init_cred` (uid 0), then **W3** clears the seccomp filter so the rooted child can
+hand off. The handoff runs a root script as uid 0; instead of relying on KernelSU (whose
+`ksud late-load` needs a KernelSU driver that a stock kernel does not have), it leaves a
+small userspace agent (`ghostsu`) running. Any later adb shell can then run commands as
+root through the socket:
+
+```bash
+adb shell '/data/local/tmp/su -c id'      # uid=0(root) ...
+adb shell '/data/local/tmp/su'           # interactive root shell
+```
+
+The agent lives until the next reboot. Everything is a pure data write; control flow
+protected by CFI is never touched.
 
 ## Requirements
 
@@ -47,8 +59,9 @@ pure data write; control flow protected by CFI is never touched.
   Kernel version)
 - A computer (macOS / Linux) with **Android SDK Platform-Tools** (adb) installed
 - **USB debugging** enabled on the tablet (Developer options)
-- [KernelSU manager](https://github.com/tiann/KernelSU/releases) APK installed on the
-  tablet (the root script extracts `ksud` from the manager APK to load the module)
+- Optional: [KernelSU manager](https://github.com/tiann/KernelSU/releases) APK, only if
+  you also want KernelSU's persistent module (the temporary `su` channel does not need
+  it)
 
 ## Build
 
@@ -57,7 +70,8 @@ pure data write; control flow protected by CFI is never touched.
 ./build.sh
 ```
 
-Output: `build/native/ghostlock`. The script probes common NDK locations; you can also
+Output: `build/native/ghostlock` (the exploit) and `build/native/ghostsu` (the root
+agent/client used for the temporary adb root). The script probes common NDK locations; you can also
 point it explicitly: `ANDROID_NDK_HOME=/path/to/ndk ./build.sh`.
 
 Profiles are prebuilt (`profiles/*.bin`); a matching `.conf` is shipped next to each one
@@ -84,12 +98,19 @@ against a device whose `ro.product.device` is not `dizi` (override with
 The script runs the whole flow automatically. The **tablet may reboot a few times**
 during the run, which is normal: the exploit's heap reclaim is probabilistic (roughly a
 1/3–1/2 chance per attempt), and the script retries until it succeeds. When you see
-`ROOTED + KernelSU active`, you are done. In practice this usually takes a few minutes to
-about twenty minutes.
+`ROOTED`, you are done. In practice this usually takes a few minutes to about twenty
+minutes.
 
-Root is **jailbreak mode (lost on reboot)**: just run `reroot.sh` again after a reboot.
-KernelSU modules and their authorization state live in `/data/adb` and are restored
-automatically after re-rooting.
+Root is **temporary (lost on reboot)**: just run `reroot.sh` again after a reboot. While
+the agent is running:
+
+```bash
+adb shell '/data/local/tmp/su -c id'
+adb shell '/data/local/tmp/su'
+```
+
+If a KernelSU manager is installed, the same handoff also tries KernelSU's module load; a
+successful module load is reported separately and is not required for the temporary root.
 
 ## FAQ
 
@@ -98,8 +119,9 @@ automatically after re-rooting.
 - **It keeps failing?** Make sure the kernel version matches exactly. A different
   MIUI/HyperOS build ships a different kernel and cannot use this profile.
 - **How do I go back to stock?** A reboot returns the device to the unrooted state. No
-  partition is ever written, so nothing persists (except the KernelSU configuration in
-  `/data/adb`, which can be removed from the manager).
+  partition is ever written, so nothing persists: a reboot also removes the temporary
+  root agent and restores SELinux enforcing (except the KernelSU configuration in
+  `/data/adb`, if a manager was used).
 
 ## Disclaimer
 

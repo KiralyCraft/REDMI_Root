@@ -5,6 +5,13 @@
 
 #include "kernel/offset.h"
 
+/* bionic's <bits/page_size.h> (NDK r26+) defines PAGE_SIZE as a macro, which
+ * would rewrite the kernel-side constant below into an expression. The exploit
+ * needs its own name for the kernel page size, so drop the libc macro here. */
+#ifdef PAGE_SIZE
+#undef PAGE_SIZE
+#endif
+
 namespace ghostlock::kernel {
     inline constexpr unsigned PAGE_SHIFT = 12;
     inline constexpr unsigned long PAGE_SIZE = 1UL << PAGE_SHIFT;

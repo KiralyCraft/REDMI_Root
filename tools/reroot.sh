@@ -12,6 +12,8 @@
 cd "$(dirname "$0")/.." || exit 1
 
 BIN=build/native/ghostlock
+AGENT=build/native/ghostsu
+SHIM=tools/ksud-agent-shim.sh
 # Select the profile for the device's real kernel build before every push
 # (build-exact; never reuse a profile across builds).
 # PROFILE=... explicitly overrides the selection, but the file must exist.
@@ -109,9 +111,23 @@ cleanup_strays() {
 push_all() {
     resolve_profile || exit 1
     [ -f "$BIN" ] || { echo "!! missing binary: $BIN (build it on the build machine and copy it back)"; exit 1; }
+    [ -f "$AGENT" ] || { echo "!! missing binary: $AGENT (make -C src ghostsu)"; exit 1; }
+    [ -f "$SHIM" ] || { echo "!! missing shim: $SHIM"; exit 1; }
     adb_target push "$BIN" /data/local/tmp/ghostlock >/dev/null 2>&1
+    adb_target push "$AGENT" /data/local/tmp/ghostsu >/dev/null 2>&1
     adb_target push "$PROFILE" /data/local/tmp/profile.bin >/dev/null 2>&1
-    adb_target shell chmod 755 /data/local/tmp/ghostlock 2>/dev/null
+    adb_target shell 'chmod 755 /data/local/tmp/ghostlock /data/local/tmp/ghostsu && cp /data/local/tmp/ghostsu /data/local/tmp/su && chmod 755 /data/local/tmp/su' 2>/dev/null
+    # The handoff script runs /data/local/tmp/ksud as uid 0. Preserve a real
+    # ksud (if one is there) and install the shim that starts the agent.
+    adb_target shell 'if [ -f /data/local/tmp/ksud ] && ! grep -q ghostsu /data/local/tmp/ksud 2>/dev/null; then mv -f /data/local/tmp/ksud /data/local/tmp/ksud.real; fi' >/dev/null 2>&1
+    adb_target push "$SHIM" /data/local/tmp/ksud >/dev/null 2>&1
+    adb_target shell 'chmod 755 /data/local/tmp/ksud' 2>/dev/null
+}
+
+# Root channel probe: the ghostsu agent first (temporary, userspace), then
+# KernelSU's su if the module happens to be active.
+root_id() {
+    adb_target shell '/data/local/tmp/su -c id 2>/dev/null || su -c id 2>/dev/null' 2>/dev/null | tr -d '\r'
 }
 
 # Read-only preflight: proves the device, the profile and the binary line up
@@ -130,7 +146,10 @@ if [ "$CHECK" = "1" ]; then
     echo "== selinux: enforcing=$enf"
     resolve_profile || exit 1
     [ -f "$BIN" ] || { echo "!! missing binary: $BIN"; exit 1; }
+    [ -f "$AGENT" ] || { echo "!! missing binary: $AGENT"; exit 1; }
     echo "== binary:  $BIN ($(stat -c %s "$BIN") bytes, sha256 $(sha256sum "$BIN" | cut -d' ' -f1))"
+    echo "== agent:   $AGENT ($(stat -c %s "$AGENT") bytes, sha256 $(sha256sum "$AGENT" | cut -d' ' -f1))"
+    echo "== shim:    $SHIM (starts the agent from the rooted ksud path)"
     echo "== profile: $PROFILE ($(stat -c %s "$PROFILE") bytes, sha256 $(sha256sum "$PROFILE" | cut -d' ' -f1))"
     echo "== preflight OK (nothing was pushed, nothing was executed)"
     exit 0
@@ -143,8 +162,9 @@ while true; do
     cleanup_strays
 
     # Already rooted: nothing to do
-    if adb_target shell "su -c id" 2>/dev/null | grep -q "uid=0"; then
-        echo "== KernelSU already active, nothing to do"
+    if root_id | grep -q "uid=0"; then
+        echo "== root active, nothing to do"
+        root_id | head -1
         exit 0
     fi
 
@@ -173,8 +193,11 @@ while true; do
         push_all
         adb_shell_timeout 240 "cd /data/local/tmp && ./ghostlock --load-prebuilt-profile /data/local/tmp/profile.bin" > /dev/null 2>&1
         cleanup_strays
-        if adb_target shell "su -c id" 2>/dev/null | grep -q "uid=0"; then
-            echo "== ROOTED + KernelSU active (attempt $ATTEMPT, try $i)"
+        if root_id | grep -q "uid=0"; then
+            echo "== ROOTED (attempt $ATTEMPT, try $i)"
+            root_id | head -1
+            echo "== temporary root until reboot: adb shell '/data/local/tmp/su -c id'"
+            echo "== interactive root shell:       adb shell /data/local/tmp/su"
             exit 0
         fi
         sleep 2
