@@ -15,20 +15,24 @@ authoritative history. Convention per AGENTS.md: read this before working in the
   uid-0 root on `dizi` via the userspace `ghostsu` agent (no KernelSU), SELinux permissive until
   reboot. Empirical fields (`kernel_phys_load`, `skb_reclaim_sends`, `skb_frag_bias`) remain
   unconfirmed; a second cold-boot pass is still open.
-- **Bootloader unlock storage located (2026-10-29):** the `ANDROID-BOOT!` device-info blob lives in
-  `devinfo` (`/dev/block/sde58`, 4096 B). Byte 13 = `is_unlocked`, byte 14 = `unlock_critical`;
-  ABL checks only the 13-byte magic (no signature/CRC), and the partition is writable from Android
-  root. Writing those bytes is the concrete unlock path; it has **not** been executed (user
-  directive). Details in the 2026-10-29 entry and `docs/bootloader-unlock-DIZI.md`.
+- **Unlock attempt FAILED (2026-10-29, 09:48 EET):** an authorized ordinary-only edit of
+  `devinfo[13]` from 0 to 1 (critical byte 14 kept 0) passed full 4096-byte readback before reboot.
+  After reboot, the correct tablet's bootloader still reports `Device unlocked: false` and
+  `unlocked: no`. **Stopped before wiping.** Earlier claims that this writable blob alone is a
+  concrete unlock path are superseded; the VB protocol's authoritative backing/storage behavior
+  remains unresolved. The tablet is responsive in bootloader fastboot, slot `a`, critical locked;
+  Android boot and the raw post-reboot `devinfo` bytes have not been rechecked. No firmware/GPT
+  flashing, userdata/metadata wipe, EDL entry or custom RAM boot was performed.
 - **Unlock side effects analysed (2026-10-29, read-only):** the `devinfo` write itself is low-risk
   (a corrupt magic re-inits from the TZ secure-state default, expected locked; a read/write failure
   is a boot-entry error). The skipped
   official `misc` wipe is the main open question: `/data` is metadata-encrypted with a
   Keymaster-wrapped key, and if the lock-state change invalidates it the device cannot mount
   `/data` (soft brick until a factory reset). Code evidence favours key survival but is
-  **unconfirmed**. Safe path if data loss is acceptable: write, then wipe `/data` + `/metadata`
-  before the first Android boot; if data must be kept, back up and test. Not executed. Details in
-  the 2026-10-29 entry and `docs/bootloader-unlock-DIZI.md` §9.1.
+  **unconfirmed**. A clean reset was authorized but **not executed**, because the ordinary unlock
+  attempt failed its post-reboot verification. Do not wipe or retry on the assumption that the
+  tablet is unlocked. Details in the 2026-10-29 execution entry and
+  `docs/bootloader-unlock-DIZI.md`.
 
 ## Journal
 
@@ -851,6 +855,75 @@ Offline follow-up only; no adb/fastboot command, unlock, wipe, reboot or RAM boo
 
 Updated `docs/bootloader-unlock-DIZI.md` §§7.1–7.2 and qualified the earlier first-boot guarantee.
 
+### 2026-10-29 — Unlock authorized; preflight and off-device backups complete
+
+The user authorized the unlock, bootloader reboot, userdata/metadata wipe and stock reboot, accepting
+data loss. After being told that the direct path remains experimental and recovery cannot be
+guaranteed, the user explicitly selected **"Proceed; accept residual risk"**. Scope is **ordinary
+unlock only** (byte 13 -> 1; byte 14 remains 0), no critical unlock, no firmware/GPT changes, and no
+custom RAM boot. Stop on unexpected state or write/wipe failure.
+
+At 09:45 EET, serial `e5778c5b` was verified as `dizi`, firmware `V816.0.19.0.UNSCNXM`, exact
+`5.10.209-android12-9-00019-g4ea09a298bb4-ab12292661` kernel, slot `_a`, Android boot complete,
+green/locked, 100% battery (`Full`), live uid-0 `u:r:kernel:s0` root. Host fastboot is
+`35.0.2-android-tools`. `devinfo` resolves to `sde58`, size 4096, valid magic and flags `00 00`.
+
+Verified off-device backups are in ignored, mode-0700 directory
+`.dizi-dumps/unlock-preflight-20261029-094508/`; each stream matched an independent on-device hash:
+
+| file | bytes | SHA-256 |
+| --- | --- | --- |
+| `devinfo.before.img` | 4096 | `a799fba76a204f67eabd37ab48fa61d1ca459be9afe160eb14b0a876030ce0c2` |
+| `misc.before.img` | 1048576 | `ca6dc3b64ed590f8af9b78fa3177243f6ad22a1f8ada93de77a0e4c9a61e2fd0` |
+| `frp.before.img` | 524288 | `1a462029354328d59cd182c4ba549a3165beaf667efc7bc96637ab76c248488f` |
+
+All three match the earlier recorded hash prefixes. At this entry's creation no unlock write, wipe
+or reboot has occurred; execution results will be appended separately. `a37b82` remains untouched.
+
+### 2026-10-29 — Ordinary-only `devinfo` write verified, but bootloader STILL LOCKED; stopped
+
+Authorized execution after the preflight above, approximately 09:48 EET:
+
+1. Created an off-device copy differing from `devinfo.before.img` at **offset 13 only** (`00 -> 01`).
+   Byte 14 stayed `00`. Staged it at `/data/local/tmp/devinfo.normal-unlock-20261029.img`.
+2. A guarded root command rechecked device/build, root, battery >=80%, node `sde58`, 4096-byte
+   partition length, original hash and staged-image hash, then issued one full-sector `dd`, `sync`
+   and `cmp`. Write returned 4096 bytes, `cmp` passed, and an independent host read of the whole
+   partition was byte-identical to the staged image. Post-write SHA-256:
+   `51f11e795f59e53cf2b0edafe89c0426757e654325ae023daeb4f5dd9aec0a3f` (flags `01 00`).
+3. Ran `adb -s e5778c5b reboot bootloader`. Fastboot responded normally. Targeted queries returned:
+
+   ```text
+   serialno: e5778c5b
+   product: dizi
+   is-userspace: no
+   (bootloader) Verity mode: true
+   (bootloader) Device unlocked: false
+   (bootloader) Device critical unlocked: false
+   (bootloader) Charger screen enabled: true
+   unlocked: no
+   current-slot: a
+   snapshot-update-status: none
+   ```
+
+4. The unlocked-state assertion failed. **No `fastboot -w`, metadata erase, firmware/GPT flash,
+   EDL entry, custom RAM boot or further reboot was attempted.** The tablet was left responsive
+   in bootloader fastboot. `a37b82` was never targeted.
+
+Logs, before/staged/readback images and the backup manifest remain in ignored directory
+`.dizi-dumps/unlock-preflight-20261029-094508/` (`stage.log`, `write.log`,
+`fastboot-verification.log`). No device-specific binary dumps are committed.
+
+**Correction:** the previous identification of the writable `devinfo` blob as the authoritative
+VB-protocol store was too strong. The ordinary-only edit did **not** unlock this device. Whether
+the byte persisted across reboot, the partition is a mirror/unused store, another boot stage
+restored state, or some additional condition applies is **unconfirmed**. There is no evidence
+justifying a critical-unlock retry, a wipe, or a claim that Android has been freshly reset.
+
+Next safe investigation is to check post-reboot bytes and resolve VB-protocol backing/build
+identity; this requires a separately considered return to stock Android/root or offline analysis.
+Earlier journal entries are retained as history and superseded where they claim a proven unlock.
+
 ## Open items / next actions
 
 1. ✅ On ResearchVM: `kernel/common` @ `4ea09a298bb4` fetched, clang-r416183b downloaded, vmlinux
@@ -866,20 +939,12 @@ Updated `docs/bootloader-unlock-DIZI.md` §§7.1–7.2 and qualified the earlier
 5. The 5.10.209 profile passed its first cold-boot gate run on 2026-10-29 (run 6: W1 + W2,
    temporary root via `ghostsu`; entry above and `docs/device-gate-DIZI-02.md`). A **second**
    consecutive cold-boot pass is still open before calling it production-ready.
-6. ✅/⏳ Bootloader unlock path located. The blob is in **`devinfo`** (`sde58`), not `frp`; the unlock
-   state is bytes 13/14, ABL checks only the `ANDROID-BOOT!` magic, and the partition is writable
-   from Android root (nonzero write test passed and was restored). This is a real unlock path: the
-   token and lock handlers use the same setters, and AVB/flash/erase/EDL/rollback gate on the same
-   bytes. The UEFI variable store (`uefivarstore`, 512 KiB) contains only standard EFI variables —
-   no unlock variable — so the GBL-style "UEFI app sets the variable" trick does not apply. **Not
-   executed** per the user directive; executing and verifying the reboot is the remaining step
-   (controlled window; loses the temporary root). Details in the 2026-10-29 entries and
-   `docs/bootloader-unlock-DIZI.md`. Side-effect analysis (2026-10-29): the bootloader write is
-   low-risk, but the direct write skips the official `misc` wipe. `/data` is metadata-encrypted with
-   a Keymaster-wrapped key; if that key is invalidated by the boot-state change, `vold`/`fs_mgr`
-   cannot mount `/data` and the device soft-bricks until a factory reset. Code evidence favours
-   survival, but the closed TA behavior is unconfirmed. If data loss is acceptable, wipe `/data` and
-   `/metadata` after the write; if data must be kept, back up and test first.
+6. ❌/⏳ The authorized ordinary-only `devinfo` edit **failed to unlock after reboot** despite
+   complete pre-reboot write/readback verification. Tablet remains responsive in bootloader
+   fastboot, ordinary and critical locked; no wipe or firmware/GPT flash performed. Determine
+   whether the byte persisted and resolve the authoritative VB-protocol store before proposing
+   another write. The earlier "concrete unlock path" conclusion is superseded, not confirmed.
+   Details in the execution entry above and `docs/bootloader-unlock-DIZI.md` §1.1.
 7. ⏳ Optional kernel-module root. Signatures are off (`CONFIG_MODULE_SIG` not set) but the device
    kernel is `CONFIG_CFI_CLANG=y` + `CONFIG_LTO_CLANG_FULL=y`, while the VM oracle tree is
    `LTO_NONE`/no CFI. A compatible `.ko` needs a CFI+LTO rebuild of that tree (or a loader for an
