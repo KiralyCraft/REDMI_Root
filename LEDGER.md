@@ -442,21 +442,36 @@ Post-remediation runs after installing KernelSU + pushing ksud (all on `e5778c5b
 - **Run 3** (22:39–22:46, `tools/reroot.sh`, log `/tmp/opencode/gate-209-run3-223947.log`): 6 attempts,
   W1 hit 1/6, one W2 try, panics.
 - **Run 4** (22:48–22:52, instrumented driver): 4 attempts, 0/4 W1 hits — panics during the race.
-- **Run 5** (22:53–23:51+, instrumented driver with full stdout capture, log `/tmp/opencode/gate-209-run5.log`):
-  44 attempts, W1 hit 7/44 (~16%, with a panic on most misses), 9 W2 tries, **zero landings**: the route
-  reports `success=1` (race-hit bookkeeping) but `verify_w2_stage` always reads `child uid = 2000` →
-  "W2 failed after 1 rounds". Collision screens report 9/7–14/7 — passing, but unstable relative to the
-  expected 7-slot geometry; consistent with `skb_reclaim_sends=16`/`skb_frag_bias=384` being
-  heap-state dependent, **not confirmed** by any post-remediation attempt — and **not falsified**:
-  Run 1 landed once with the same profile. The instrumented loop remains running to catch a landing.
-- **Key discriminator**: `/data/local/tmp/.ghostlock_ksu.log` mtime is still 21:57 device-clock — Run 1's
-  pre-push execution. No post-push W2 landing has ever executed the root script, so `[!] ksud missing` in
-  the log is a stale artifact; the post-push handoff (`late-load kmi=android12-5.10`) remains untested.
-  ksud itself is confirmed present and `-x` from the shell domain (`/data/local/tmp/ksud`).
-- Repeated panics mid-race (~10 reboots across runs); `kernel_phys_load` p0 values self-confirm at
-  runtime on every attempt (`delta=0x28000000`, anchors match the profile).
+- **Run 5** (22:53–00:55, instrumented driver with full stdout capture, log `/tmp/opencode/gate-209-run5.log`):
+  87 attempts. **W2 does land** — see the correction below — so the geometry is not the blocking part.
+  Collision screens report 9/7–14/7 (passing, but unstable relative to the expected 7-slot geometry);
+  `skb_reclaim_sends=16`/`skb_frag_bias=384` remain **unconfirmed** and **not falsified** (Run 1 landed
+  once with the same profile). `kernel_phys_load=0xa8000000` self-confirms on every attempt.
 
-Loop continues until root or until the signature stops being informative.
+#### 2026-10-29 — correction: W2 lands, root is still not reached, and the blocker is the LKM load
+
+Read-only re-reading of the run-5 log and the device contradicts the earlier "zero landings" reading:
+
+- `grep -c "root script start uid=0" gate-209-run5.log` = **7**. The landed child's root script executed
+  as `uid=0 euid=0` with `Seccomp: 0`, completed the policy fixup (`policyload before=0 after=2`,
+  `policy fixup rc=0`) and cached `/proc/iomem` (11258 B). So the write lands; `verify_w2_stage`
+  reporting `child uid = 2000` is a **false negative** — it reads the child before the cred overwrite is
+  observable, so runs were misclassified as misses.
+- Every landing ran `ksud late-load --kmi android12-5.10 --allow-shell`, which **exited 0 with no
+  output** and the module never appeared in `/proc/modules` during the 5 s watch →
+  `[!] KernelSU module not loaded`. Root is therefore not established. Device state at 07:40:
+  `su` not found, `grep -c kernelsu /proc/modules` = 0, `/sys/fs/selinux/enforce` = 1.
+- **Why late-load cannot work on this build** (from the pushed `lib/arm64-v8a/libksud.so`, KernelSU
+  v3.3.1, PIE aarch64): `late-load` (`ksud::late_load`) is implemented through the **KernelSU driver**
+  (`anon_inode:[ksu_driver]`, `ksu_driver_su`, string `KernelSU driver install syscall was blocked by
+  seccomp`) — it has no `finit_module`. On a stock kernel with no KernelSU driver there is nothing for
+  it to trigger, which matches the observed silent exit 0. This binary also has no `--kmi` string, so the
+  flag the handoff passes is probably not recognized by this build either.
+- Two ways forward, neither yet attempted: (1) extract the embedded `android12-5.10_kernelsu.ko` from the
+  manager APK assets and load it from the uid-0 context with `finit_module`/`init_module` directly;
+  (2) `ksud boot-patch` the boot image and write `boot_a` — which requires the lock state to be flipped,
+  i.e. it depends on the unauthenticated ABL device-info blob recorded above.
+
 
 ### 2026-10-28 — Bootloader (XBL/ABL) hunt: the ABL volume *does* decode, and the unlock path is enumerated
 
