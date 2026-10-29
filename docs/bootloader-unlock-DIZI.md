@@ -79,9 +79,10 @@ The ABL image comes from the exact-build OTA. Addresses are Ghidra addresses in
 - Reads 0x998 bytes through the VB protocol (`FUN_00030ad8(0, buf, 0x998)`).
 - Compares the first 13 bytes with `"ANDROID-BOOT!"`.
 - On match: uses the stored struct as-is (no further checks).
-- On mismatch: zeroes it, writes the magic, sets `is_unlocked = (secure_state == 0)` (secure state
-  is 1 here → locked), `is_unlock_critical = is_unlocked`, byte `0x90 = 1`, then writes it back.
-  A corrupted blob therefore re-initializes **locked**, not bricked.
+- On mismatch: zeroes it, writes the magic, sets `is_unlocked = (secure_state == 0)` (the
+  TZ-derived secure-state bit; on a production secure device this re-initializes locked, though the
+  raw TZ state was not read), `is_unlock_critical = is_unlocked`, byte `0x90 = 1`, then writes it
+  back. A corrupted blob therefore re-initializes from the secure-state default, not bricked.
 
 ### 4.2 Setters and the official paths
 
@@ -189,7 +190,8 @@ or, from root, write bytes 13/14 back to `0x00` with the same `dd` sequence.
 - **Temporary root window.** The write must happen while the `ghostsu` agent is alive; SELinux is
   permissive and the abstract socket is reachable by any process during that window. Use a
   controlled test device and reboot when done.
-- **Corruption is recoverable:** a blob without the magic re-initializes locked.
+- **Corruption is recoverable:** a blob without the magic re-initializes from the TZ secure-state
+  default (expected locked), not bricked.
 
 ### 9.1 Side-effect analysis: the skipped wipe is the main risk (2026-10-29)
 
@@ -202,13 +204,14 @@ metadata key survives the boot-state change.
 **Confirmed on this build (read-only):**
 
 - **ABL failure path.** `FUN_000493a0` reads 0x998 bytes; a valid magic is used as-is. On a magic
-  mismatch it zeroes the blob, writes the magic, sets `is_unlocked = (secure_state == 0)` (secure
-  state is 1 here, so locked), `is_unlock_critical = is_unlocked`, byte `0x90 = 1`, and writes the
-  blob back. The boot entry `FUN_0000135c` logs `Initialize the device info failed: %r` and returns
+  mismatch it zeroes the blob, writes the magic, sets `is_unlocked = (secure_state == 0)` (the
+  TZ-derived secure-state bit; on a production secure device this re-initializes locked, but the raw
+  TZ state was not read), `is_unlock_critical = is_unlocked`, byte `0x90 = 1`, and writes the blob
+  back. The boot entry `FUN_0000135c` logs `Initialize the device info failed: %r` and returns
   the error if the read or the re-init write fails. There is no CRC/signature. A corrupted blob
-  therefore re-initializes **locked**; a failed read/write is a boot-entry error that may
-  halt/enter fastboot or EDL. It is not a data change, and the partition is healthy (the 0xF00
-  write-and-restore test passed).
+  therefore re-initializes from the secure-state default; a failed read/write is a boot-entry error
+  that may halt/enter fastboot or EDL. It is not a data change, and the partition is healthy (the
+  0xF00 write-and-restore test passed).
 - **Encryption stack.** `/data` is file-based encrypted (`ro.crypto.type=file`) with metadata
   encryption (`ro.crypto.metadata.enabled=true`); the metadata key is stored under
   `/metadata/vold/metadata_encryption` and wrapped by a Keystore/Keymaster key. The metadata
@@ -257,7 +260,7 @@ metadata key survives the boot-state change.
 | --- | --- | --- | --- |
 | `/data` metadata key unusable -> no Android boot | unconfirmed; low on code evidence, not excluded | soft brick; factory reset (data loss) | wipe `/data` and `/metadata` after the write; or use the official token/`--wipe_data` |
 | `devinfo` read/write failure or power loss during the 4 KiB write | very low on healthy UFS; higher if power is interrupted | boot-entry error / halt; fastboot or EDL recovery | full-sector read/modify/write, `sync`, verify, keep charged, do not interrupt |
-| corrupt magic | low | ABL re-initializes the blob locked | the blob is magic-only; the re-init writes a locked blob |
+| corrupt magic | low | ABL re-initializes the blob from the TZ secure-state default (expected locked; raw TZ state not read) | the blob is magic-only; the re-init does not brick |
 | orange state / AVB errors tolerated | certain | boot warning; Play Integrity, SafetyNet, banking and some DRM apps may refuse; OTA untested | accept, or re-lock with stock images |
 | security exposure | certain | unlocked + critical unlocked allows `fastboot flash`/`erase` of critical partitions; data at rest remains encrypted but a physical attacker can flash a custom image | official wipe, physical control, re-lock when done |
 | warranty | likely | warranty void; vendor support may refuse | accept |
@@ -282,8 +285,9 @@ metadata key survives the boot-state change.
    is intact, and be prepared to factory reset if it does not. A sacrificial unit is preferable.
 3. **Write safety.** Read the whole 4096-byte sector, patch bytes 13/14 in memory, write the full
    sector once, `sync`, read back both bytes, and only then reboot. Keep the tablet charged; do not
-   interrupt the write. A corrupt magic re-initializes locked; a failed read/write is a boot-entry
-   error recoverable through fastboot/EDL, not an automatic data wipe.
+   interrupt the write. A corrupt magic re-initializes from the TZ secure-state default (expected
+   locked), not a brick; a failed read/write is a boot-entry error recoverable through fastboot/EDL,
+   not an automatic data wipe.
 4. **After unlock.** Expect `ro.boot.flash.locked=0` and `ro.boot.verifiedbootstate=orange`; verify
    `/data` and the user data. Treat Play Integrity/SafetyNet, banking, Widevine L1, OTA and warranty
    as changed until tested. Do not flash a bad bootloader image; re-lock only with stock images and

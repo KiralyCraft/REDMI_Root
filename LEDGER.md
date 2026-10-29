@@ -21,7 +21,8 @@ authoritative history. Convention per AGENTS.md: read this before working in the
   root. Writing those bytes is the concrete unlock path; it has **not** been executed (user
   directive). Details in the 2026-10-29 entry and `docs/bootloader-unlock-DIZI.md`.
 - **Unlock side effects analysed (2026-10-29, read-only):** the `devinfo` write itself is low-risk
-  (a corrupt magic re-inits locked; a read/write failure is a boot-entry error). The skipped
+  (a corrupt magic re-inits from the TZ secure-state default, expected locked; a read/write failure
+  is a boot-entry error). The skipped
   official `misc` wipe is the main open question: `/data` is metadata-encrypted with a
   Keymaster-wrapped key, and if the lock-state change invalidates it the device cannot mount
   `/data` (soft brick until a factory reset). Code evidence favours key survival but is
@@ -710,7 +711,8 @@ each stream was cross-checked with an on-device `sha256sum` of the same block de
 - `FUN_000493a0` is the load/init routine. It is called from the boot entry `FUN_0000135c` at
   `0x1454`, **before** the AVB call at `0x1c64`. It reads 0x998 B through the VB protocol; if the
   13-byte magic matches, the struct is trusted as-is. On mismatch it zeroes the struct, writes the
-  magic, sets `is_unlocked = (secure_state == 0)` (secure state is 1 on this device → locked),
+  magic, sets `is_unlocked = (secure_state == 0)` (the TZ-derived secure-state bit; on this
+  production secure device the re-init is expected locked, though the raw TZ state was not read),
   `is_unlock_critical = is_unlocked`, byte 0x90 = 1, and writes it back. **No CRC, signature or TZ
   check is applied to the magically-valid blob.**
 - `FUN_00048e10(v)` writes offset 13; `FUN_00048ee8(v)` writes offset 14; both persist the full
@@ -770,8 +772,8 @@ the magic; `frp` carries only the already-open allow flag; `uefivarstore` has no
 This is also the bootloader weakness itself: the persistent unlock state is unauthenticated, so any
 uid-0 (including the temporary kernel-exploit root) can flip it without the Xiaomi server token.
 
-**Caveats:** not executed (user directive). A corrupted blob re-initializes locked, so the failure
-mode is not a brick. The direct write skips the `--wipe_data`/`--just_exit` request of the official
+**Caveats:** not executed (user directive). A corrupted blob re-initializes from the TZ
+secure-state default (expected locked); either way, the failure mode is not a brick. The direct write skips the `--wipe_data`/`--just_exit` request of the official
 flow, so userdata is retained unless wiped manually. XBL still verifies ABL (secure boot), so a bad
 bootloader image can still brick; use stock images for critical partitions. OTA/rollback behavior
 after unlocking is untested.
@@ -808,7 +810,8 @@ Read-only follow-up to the `devinfo` entry: what a direct write changes beyond b
   value, and the `SET_BOOT_STATE`/`WRITE_KM_DEVICE_STATE` commands are separate. The blob is CBOR
   with hardware-enforced tags (the TA exposes `KM_TAG_ROOT_OF_TRUST`), but its exact
   root-of-trust handling was not decoded. Suggestive, not proof.
-- ABL: a corrupt magic re-initializes the blob locked; a read/write failure returns a boot-entry
+- ABL: a corrupt magic re-initializes the blob from the TZ secure-state default (expected locked;
+  the raw TZ state was not read); a read/write failure returns a boot-entry
   error (`Initialize the device info failed`) and can halt / enter fastboot / EDL. The 0xF00
   write-and-restore test shows the UFS partition is healthy.
 
