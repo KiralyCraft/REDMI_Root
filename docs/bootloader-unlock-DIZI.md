@@ -191,6 +191,104 @@ or, from root, write bytes 13/14 back to `0x00` with the same `dd` sequence.
   controlled test device and reboot when done.
 - **Corruption is recoverable:** a blob without the magic re-initializes locked.
 
+### 9.1 Side-effect analysis: the skipped wipe is the main risk (2026-10-29)
+
+The direct write changes the same two bytes as the official token unlock. The only behavioral
+difference is that `FUN_00048908` also writes a `boot-recovery` / `--wipe_data` request to `misc`
+(section 4.2); the direct write leaves `misc` untouched. Whether that skipped wipe is only a
+security policy or also a functional requirement depends on whether the Keymaster-wrapped
+metadata key survives the boot-state change.
+
+**Confirmed on this build (read-only):**
+
+- **ABL failure path.** `FUN_000493a0` reads 0x998 bytes; a valid magic is used as-is. On a magic
+  mismatch it zeroes the blob, writes the magic, sets `is_unlocked = (secure_state == 0)` (secure
+  state is 1 here, so locked), `is_unlock_critical = is_unlocked`, byte `0x90 = 1`, and writes the
+  blob back. The boot entry `FUN_0000135c` logs `Initialize the device info failed: %r` and returns
+  the error if the read or the re-init write fails. There is no CRC/signature. A corrupted blob
+  therefore re-initializes **locked**; a failed read/write is a boot-entry error that may
+  halt/enter fastboot or EDL. It is not a data change, and the partition is healthy (the 0xF00
+  write-and-restore test passed).
+- **Encryption stack.** `/data` is file-based encrypted (`ro.crypto.type=file`) with metadata
+  encryption (`ro.crypto.metadata.enabled=true`); the metadata key is stored under
+  `/metadata/vold/metadata_encryption` and wrapped by a Keystore/Keymaster key. The metadata
+  partition (`sda9`, ext4, 64 MiB) contains `/vold/metadata_encryption/key` (210-byte
+  `keymaster_key_blob`, 278-byte `encrypted_key`) and a `key_back` backup with the same layout.
+- **`vold` failure path.** `read_key()` uses `retrieveOrGenerateKey()`: when the `key` directory
+  exists, it calls `retrieveKey()`; a `decryptWithKeystoreKey failed` result returns false. It does
+  **not** generate a replacement or delete `key` in that path. `deleteAllKeys()` runs only when the
+  key directory is **missing** and `ro.crypto.metadata_init_delete_all_keys.enabled=true`.
+- **`fs_mgr` failure path.** `fs_mgr_mount_all()` calls `vdc cryptfs encryptFstab` for the
+  metadata-encrypted `/data`. A failure returns `FS_MGR_MNTALL_FAIL`; the auto-format branch
+  requires `partition_wiped` **and** `formattable`, and a key failure does not wipe the partition.
+  The device therefore cannot mount `/data` and goes to recovery / "Can't load Android system".
+  A factory reset (data loss) is required. This is a **soft brick**, not a hard brick.
+- **Keymaster state handling.** The device's Keymaster TA is `KeymasterLite` in `tz_a` (strings:
+  `SET_BOOT_STATE`, `READ_KM_DEVICE_STATE`, `WRITE_KM_DEVICE_STATE`,
+  `KeymasterLite_verifyKeyBlob`, `encryptDecryptKeyBlob`, `deserializeKeyBlobCommon`,
+  `KM_TAG_NO_AUTH_REQUIRED`, `KM_TAG_ROLLBACK_RESISTANT`, `KM_TAG_ROOT_OF_TRUST`). The userspace
+  `libqtikeymaster4.so` sends `set_boot_state_req`, `set_device_locked`, and
+  `set_early_boot_ended`. `vold` creates the metadata key with `NO_AUTH_REQUIRED` / optional
+  `ROLLBACK_RESISTANT` (`KeyStorage.cpp`), not with `UNLOCKED_DEVICE_REQUIRED`. The TA's
+  `generate_key_context` (Ghidra) mixes the key-blob fields with a 0x50-byte device field and a
+  hardware-derived cipher key; it does not visibly consume a current boot-state value, and the
+  `SET_BOOT_STATE` / `WRITE_KM_DEVICE_STATE` commands are implemented separately. The key blob is a
+  CBOR structure with hardware-enforced tags (the TA exposes `KM_TAG_ROOT_OF_TRUST`), but its exact
+  root-of-trust handling was not decoded. This is **suggestive**, not proof: the metadata key is
+  expected to remain usable, but the closed-source TA's exact `verifyKeyBlob` / `SET_BOOT_STATE`
+  interaction is **not proven**.
+- **Only the wipe differs.** The direct write leaves `frp`, `persist`, `uefivarstore`, and the
+  current benign `misc` content unchanged; the official flow's `misc` request is the only
+  unlock-related side effect it skips.
+
+**Unconfirmed:**
+
+- Whether the closed `KeymasterLite` TA rejects the existing metadata key blob after the
+  green/locked -> orange/unlocked transition. If it does, the first Android boot cannot mount
+  `/data` and needs a factory reset (soft brick, data loss). The code evidence favours survival,
+  but it is not a device test.
+- Whether an OTA installs, is refused, or changes the lock state on this non-token unlock.
+- Whether the official recovery `--wipe_data` formats `/metadata` as well as `/data`; the
+  vendor path is likely, but `fastboot erase metadata` is the explicit safe action.
+
+**Risk summary:**
+
+| risk | likelihood | impact | mitigation |
+| --- | --- | --- | --- |
+| `/data` metadata key unusable -> no Android boot | unconfirmed; low on code evidence, not excluded | soft brick; factory reset (data loss) | wipe `/data` and `/metadata` after the write; or use the official token/`--wipe_data` |
+| `devinfo` read/write failure or power loss during the 4 KiB write | very low on healthy UFS; higher if power is interrupted | boot-entry error / halt; fastboot or EDL recovery | full-sector read/modify/write, `sync`, verify, keep charged, do not interrupt |
+| corrupt magic | low | ABL re-initializes the blob locked | the blob is magic-only; the re-init writes a locked blob |
+| orange state / AVB errors tolerated | certain | boot warning; Play Integrity, SafetyNet, banking and some DRM apps may refuse; OTA untested | accept, or re-lock with stock images |
+| security exposure | certain | unlocked + critical unlocked allows `fastboot flash`/`erase` of critical partitions; data at rest remains encrypted but a physical attacker can flash a custom image | official wipe, physical control, re-lock when done |
+| warranty | likely | warranty void; vendor support may refuse | accept |
+| FRP / anti-theft | unchanged | the unlock does not bypass FRP; a factory reset may still require the Google account | keep the account credentials |
+| rollback index | certain when booting older images | older images refused | use current or newer images |
+| re-lock | follow-up risk | re-lock with modified images can brick; stock re-lock may wipe | stock images only; back up first |
+| `frp` / `persist` / `uefivarstore` / `misc` | unchanged | no boot effect | none |
+| XBL secure boot | unchanged | a bad ABL/bootloader image can still hard-brick | never flash a bad bootloader image |
+
+**Recommended execution choices:**
+
+1. **Data loss acceptable (recommended).** After setting `devinfo[13]=1`/`[14]=1` and rebooting to
+   the bootloader, wipe the old state before the first Android boot:
+   `fastboot -w` (userdata/cache) **and** `fastboot erase metadata` (the metadata key), or use the
+   official token unlock / `--wipe_data` recovery path. `/metadata` is `formattable,first_stage_mount`
+   in both fstabs, so an erased metadata partition is expected to be reformatted at first boot and
+   the key regenerated. The first Android boot then creates a fresh metadata key under the unlocked
+   state, so the key-binding question cannot soft-brick the device. This is the only procedure that
+   removes the main uncertainty.
+2. **Data must be kept.** Back up first, then accept that the first boot is an experiment: keep the
+   stock firmware and EDL/fastboot recovery available, verify that `/data` mounts and the user data
+   is intact, and be prepared to factory reset if it does not. A sacrificial unit is preferable.
+3. **Write safety.** Read the whole 4096-byte sector, patch bytes 13/14 in memory, write the full
+   sector once, `sync`, read back both bytes, and only then reboot. Keep the tablet charged; do not
+   interrupt the write. A corrupt magic re-initializes locked; a failed read/write is a boot-entry
+   error recoverable through fastboot/EDL, not an automatic data wipe.
+4. **After unlock.** Expect `ro.boot.flash.locked=0` and `ro.boot.verifiedbootstate=orange`; verify
+   `/data` and the user data. Treat Play Integrity/SafetyNet, banking, Widevine L1, OTA and warranty
+   as changed until tested. Do not flash a bad bootloader image; re-lock only with stock images and
+   after a backup.
+
 ## 10. Why this counts as the concrete unlock
 
 1. The official `oem unlock` and `oem lock` handlers write exactly bytes 13/14.

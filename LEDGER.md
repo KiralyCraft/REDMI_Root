@@ -20,6 +20,14 @@ authoritative history. Convention per AGENTS.md: read this before working in the
   ABL checks only the 13-byte magic (no signature/CRC), and the partition is writable from Android
   root. Writing those bytes is the concrete unlock path; it has **not** been executed (user
   directive). Details in the 2026-10-29 entry and `docs/bootloader-unlock-DIZI.md`.
+- **Unlock side effects analysed (2026-10-29, read-only):** the `devinfo` write itself is low-risk
+  (a corrupt magic re-inits locked; a read/write failure is a boot-entry error). The skipped
+  official `misc` wipe is the main open question: `/data` is metadata-encrypted with a
+  Keymaster-wrapped key, and if the lock-state change invalidates it the device cannot mount
+  `/data` (soft brick until a factory reset). Code evidence favours key survival but is
+  **unconfirmed**. Safe path if data loss is acceptable: write, then wipe `/data` + `/metadata`
+  before the first Android boot; if data must be kept, back up and test. Not executed. Details in
+  the 2026-10-29 entry and `docs/bootloader-unlock-DIZI.md` §9.1.
 
 ## Journal
 
@@ -768,6 +776,53 @@ flow, so userdata is retained unless wiped manually. XBL still verifies ABL (sec
 bootloader image can still brick; use stock images for critical partitions. OTA/rollback behavior
 after unlocking is untested.
 
+### 2026-10-29 — Unlock side-effect analysis: the skipped wipe is the main risk
+
+Read-only follow-up to the `devinfo` entry: what a direct write changes beyond bytes 13/14.
+**Nothing was unlocked or rebooted.**
+
+**Confirmed (read-only):**
+
+- The direct write is exactly the official state change minus the `misc` `boot-recovery` /
+  `--wipe_data` request that `FUN_00048908` writes. `frp`, `persist`, `uefivarstore` and the current
+  benign `misc` bytes are unchanged.
+- `/data` is FBE (`ro.crypto.type=file`) with metadata encryption; the metadata key is
+  `/metadata/vold/metadata_encryption/key/` (210-byte `keymaster_key_blob` + 278-byte
+  `encrypted_key`), with a `key_back` copy. `/metadata` is ext4 on `sda9` (64 MiB) with
+  `formattable,first_stage_mount` in both fstabs.
+- `vold` `retrieveOrGenerateKey`: when the key directory exists it calls `retrieveKey`; a Keystore
+  decrypt failure returns false. It does not generate or delete the key in that path.
+  `deleteAllKeys` runs only when the key directory is **missing** and
+  `ro.crypto.metadata_init_delete_all_keys.enabled=true`.
+- `fs_mgr`: a metadata `vdc cryptfs encryptFstab` failure returns `FS_MGR_MNTALL_FAIL`; the
+  auto-format branch requires `partition_wiped` **and** `formattable`, so a key failure does not
+  auto-format. `/data` cannot mount; the device goes to recovery / "Can't load Android system" and
+  needs a factory reset (data loss). This is a **soft brick**, not a hard brick.
+- The Keymaster TA on this build is `KeymasterLite` in `tz_a` (`SET_BOOT_STATE`,
+  `READ/WRITE_KM_DEVICE_STATE`, `KeymasterLite_verifyKeyBlob`, `encryptDecryptKeyBlob`,
+  `KM_TAG_NO_AUTH_REQUIRED`, `KM_TAG_ROLLBACK_RESISTANT`, `KM_TAG_ROOT_OF_TRUST`); userspace
+  `libqtikeymaster4.so` sends `set_boot_state_req`, `set_device_locked`, `set_early_boot_ended`.
+  `vold` creates the metadata key with `NO_AUTH_REQUIRED` (+ optional `ROLLBACK_RESISTANT`), not
+  `UNLOCKED_DEVICE_REQUIRED`. Ghidra: `generate_key_context` mixes the key-blob fields, a 0x50-byte
+  device field and a hardware-derived cipher key; it does not visibly consume a current boot-state
+  value, and the `SET_BOOT_STATE`/`WRITE_KM_DEVICE_STATE` commands are separate. The blob is CBOR
+  with hardware-enforced tags (the TA exposes `KM_TAG_ROOT_OF_TRUST`), but its exact
+  root-of-trust handling was not decoded. Suggestive, not proof.
+- ABL: a corrupt magic re-initializes the blob locked; a read/write failure returns a boot-entry
+  error (`Initialize the device info failed`) and can halt / enter fastboot / EDL. The 0xF00
+  write-and-restore test shows the UFS partition is healthy.
+
+**Unconfirmed:** whether the closed `KeymasterLite` rejects the existing metadata blob after
+green/locked -> orange/unlocked. The code evidence favours survival, but there is no device test.
+OTA behavior and whether the official `--wipe_data` formats `/metadata` are also unconfirmed.
+
+**Recommendation:** do not execute yet. If data loss is acceptable, the safe path is the direct
+write **plus** wiping `/data` and `/metadata` before the first Android boot (`fastboot -w`,
+`fastboot erase metadata`, or the official token / `--wipe_data` path), so a fresh metadata key is
+created under the unlocked state. If data must be kept, back up, keep stock firmware/EDL ready, and
+treat the first boot as an experiment. The write itself is low-risk; the skipped wipe is the open
+question. Details and risk table: `docs/bootloader-unlock-DIZI.md` §9.1.
+
 ## Open items / next actions
 
 1. ✅ On ResearchVM: `kernel/common` @ `4ea09a298bb4` fetched, clang-r416183b downloaded, vmlinux
@@ -790,8 +845,13 @@ after unlocking is untested.
    bytes. The UEFI variable store (`uefivarstore`, 512 KiB) contains only standard EFI variables —
    no unlock variable — so the GBL-style "UEFI app sets the variable" trick does not apply. **Not
    executed** per the user directive; executing and verifying the reboot is the remaining step
-   (controlled window; loses the temporary root). Details in the 2026-10-29 entry and
-   `docs/bootloader-unlock-DIZI.md`.
+   (controlled window; loses the temporary root). Details in the 2026-10-29 entries and
+   `docs/bootloader-unlock-DIZI.md`. Side-effect analysis (2026-10-29): the bootloader write is
+   low-risk, but the direct write skips the official `misc` wipe. `/data` is metadata-encrypted with
+   a Keymaster-wrapped key; if that key is invalidated by the boot-state change, `vold`/`fs_mgr`
+   cannot mount `/data` and the device soft-bricks until a factory reset. Code evidence favours
+   survival, but the closed TA behavior is unconfirmed. If data loss is acceptable, wipe `/data` and
+   `/metadata` after the write; if data must be kept, back up and test first.
 7. ⏳ Optional kernel-module root. Signatures are off (`CONFIG_MODULE_SIG` not set) but the device
    kernel is `CONFIG_CFI_CLANG=y` + `CONFIG_LTO_CLANG_FULL=y`, while the VM oracle tree is
    `LTO_NONE`/no CFI. A compatible `.ko` needs a CFI+LTO rebuild of that tree (or a loader for an
