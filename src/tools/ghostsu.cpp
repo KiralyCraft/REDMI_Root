@@ -264,6 +264,9 @@ namespace {
     int32_t agent_run() {
         signal(SIGHUP, SIG_IGN);
         signal(SIGPIPE, SIG_IGN);
+        /* Auto-reap connection workers. The worker resets this to SIG_DFL so it
+         * can still collect the exit status of the command it runs. */
+        signal(SIGCHLD, SIG_IGN);
         (void) setsid();
         (void) chdir("/");
         (void) umask(077);
@@ -317,6 +320,7 @@ namespace {
             if (worker == 0) {
                 close(listener);
                 signal(SIGHUP, SIG_DFL);
+                signal(SIGCHLD, SIG_DFL);
                 serve_client(client);
                 close(client);
                 _exit(0);
