@@ -254,6 +254,90 @@ stages a `misc` master clear (`recovery --wipe_data --reason=MasterClearConfirm`
 Consequently there is no tokenless unlock to pursue on this unit without a secure-world
 compromise, which is out of scope for this investigation and carries an EDL-only recovery risk.
 
+### 4.6 The normal unlock path is standard RSA-2048, not a custom scheme
+
+Offline analysis of the exact OTA (`uefi.img`) recovered the token verifier, so the question "can the
+token be brute-forced" has a concrete answer rather than a guess.
+
+**Module:** the nested UEFI volume contains FFS file
+`068aae46-bdc6-4073-85d5-31c5eef19a15`, UI name `MiTokenDxe`, holding a 45,056-byte PE32+ image.
+Its protocol is the one `oem unlock` locates in ABL (`FUN_0005db28`). Relevant functions:
+
+| Function | Role |
+| --- | --- |
+| `FUN_0000160c` | builds the token **request**: base64 of a TLV blob |
+| `FUN_0000199c` | `VerifyTokenInternal` — thin wrapper, logs `Mi_Token: VerifyTokenInternal Failed!` |
+| `FUN_00001a50` | argument shuffle into the crypto routine |
+| `FUN_00001dc8` | **RSA verification** |
+| `FUN_000020d0` / `FUN_000021fc` | Montgomery multiply / modular subtract (own bignum, no OpenSSL) |
+
+**The algorithm is RSA-2048 with `e = 65537` and PKCS#1 v1.5 signature padding**, i.e. it recomputes
+`sig^e mod N` and requires the result to be exactly
+
+```
+00 01 FF FF ... FF 00 || M            (M = the base64 request string, 1..244 bytes)
+```
+
+The code checks `local_148[0] == 0x00`, `local_148[1] == 0x01`, a run of `0xFF`, a `0x00`
+separator, then compares the tail byte-for-byte against the regenerated message. Both exponent
+branches present in the code (`0x10001` and `3`) are ordinary public exponents; this key uses
+`0x10001`.
+
+**Key location and layout** in `MiTokenDxe.efi` (`int*` view at `0x9108`):
+
+| Offset | Field |
+| --- | --- |
+| `0x9108` | word count, `0x40` (64 words = 2048 bits) |
+| `0x910c` | `n0` = `0x5d57403f`, Montgomery `-N⁻¹ mod 2³²` |
+| `0x9110` | modulus `N`, 64 words, **little-endian words, least-significant first** |
+| `0x9210` | `R² mod N` (`R = 2²⁰⁴⁸`) |
+| `0x9310` | exponent, `0x00010001` |
+
+**Decisive confirmation:** `n0 · N[0] ≡ -1 (mod 2³²)` holds exactly, and the 256 bytes at `0x9210`
+equal `pow(2, 4096, N)` exactly. A random 256-byte block has no reason to satisfy either relation, so
+`N` is the RSA modulus and not a misread constant. `N` is 2048-bit, odd, and has no prime factor
+below 100,000.
+
+| Artifact | Value |
+| --- | --- |
+| SHA-256 of `N` (256-byte big-endian) | `c21c6c4f9b5365facac2287fc27a22e0279b828fbcfb574ac852600c62b5ca44` |
+| `e` | `65537` |
+| `.dizi-dumps/mitoken-unlock-pubkey.der` (RSAPublicKey) | SHA-256 `04f02dfde7d7db27a763e43d53dc239d04f9a1022721d6a0992c58d22323fae5` |
+
+This is a **public** key. It is identical in every unit of the build; there is no secret to recover
+from the image.
+
+**What is signed.** `FUN_0000160c` assembles a TLV request and base64-encodes it into a 128-byte
+buffer cached in BSS at `0x9390`:
+
+- header bytes `55 01 01 02`;
+- tag `0x10` + **16 bytes from `EFI_RNG_PROTOCOL`** (a per-boot nonce);
+- tag `0x03` + device name (from SMEM, or the literal `undefined`);
+- tag `0x02` + `(ChipId << 32) | Serial`, read through `EfiChipinfo`/QFPROM.
+
+The cache is only filled when `DAT_00009390 == 0`, and BSS is zeroed at boot, so the nonce is
+regenerated **once per boot** and reused for the rest of that boot.
+
+**Why brute force does not apply.** This is not a password, MAC, or truncated digest:
+
+1. **There is no small secret.** Recovering the signing key from `(N, e)` means factoring a 2048-bit
+   modulus. The best published effort for RSA-2048 is the general number field sieve at a cost
+   several orders of magnitude beyond any practical budget, and no 2048-bit RSA modulus has been
+   factored publicly.
+2. **The search space is `2²⁰⁴⁸`.** Guessing a 256-byte signature has the same probability per trial
+   as guessing the private key; there is no gradient or partial-credit structure to exploit.
+3. **There is no usable oracle.** Verification happens once, inside the bootloader, and a failure
+   path in ABL prints `Token Verify Failed, Reboot the device` and reboots. Each candidate costs a
+   full boot cycle, and the per-boot nonce changes, so attempts cannot even be accumulated.
+4. **Tokens are bound and single-boot.** A valid signature covers this unit's ChipId, serial,
+   device name and the current nonce. A signature captured from another device, or from an earlier
+   boot of this device, fails the comparison of `M`.
+
+**The crypto is not the gate.** Xiaomi's server decides whether to sign a given request at all —
+account binding, eligibility and any waiting period are enforced there. The token merely carries
+that decision to the bootloader. Bypassing the token therefore means bypassing a server-side
+authorisation policy, not solving a cryptanalytic problem, and this analysis provides no such path.
+
 ## 5. Writability proof (non-destructive)
 
 `/sys/block/sde/sde58/ro` is `0`; the node is `brw------- root root`. The blob ends at `0x998`, so

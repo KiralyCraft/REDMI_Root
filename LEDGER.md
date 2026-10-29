@@ -1035,6 +1035,35 @@ that re-provisioning a provisioned RPMB **bricks the device**.
 Conclusion recorded: there is **no tokenless unlock** to pursue on this unit short of a secure-world
 compromise, which is out of scope and carries EDL-only recovery risk.
 
+### 2026-10-29 — Token path is plain RSA-2048; brute force is not applicable
+
+Offline only: no adb/fastboot command, no device write, no token submitted. The protected second
+device was not touched.
+
+Extracted `MiTokenDxe` from the exact OTA's `uefi.img` (nested FV → FFS
+`068aae46-bdc6-4073-85d5-31c5eef19a15`, 45,056-byte PE32+; `.dizi-dumps/MiTokenDxe.efi`). This is the
+provider of the protocol ABL's `oem unlock` locates.
+
+- `FUN_0000160c` builds the request: base64 of `55 01 01 02` + tag `0x10` (16 bytes from
+  `EFI_RNG_PROTOCOL`, a **per-boot nonce**) + tag `0x03` (device name from SMEM) + tag `0x02`
+  (`ChipId << 32 | Serial`). Cached in BSS `0x9390`, filled only when that byte is 0, so once per boot.
+- `FUN_0000199c` → `FUN_00001a50` → **`FUN_00001dc8`** is textbook **RSA-2048 / PKCS#1 v1.5 type-1**
+  verification with its own bignum (`FUN_000020d0` Montgomery multiply, `FUN_000021fc` subtract).
+  It requires `EM = 00 01 FF..FF 00 || M` and compares `M` byte-for-byte with the regenerated base64.
+- Key struct at `0x9108`: `[0]=0x40` words, `[1]=n0=0x5d57403f`, `N` at `0x9110` (little-endian
+  words, LSW first), `R² mod N` at `0x9210`, `e=65537` at `0x9310`.
+- **Confirmed, not assumed:** `n0·N[0] ≡ -1 mod 2³²` holds and the bytes at `0x9210` equal
+  `pow(2,4096,N)` exactly. `N` is 2048-bit, odd, no factor < 100,000.
+  SHA-256 of `N` (big-endian) = `c21c6c4f9b5365facac2287fc27a22e0279b828fbcfb574ac852600c62b5ca44`.
+  Public key saved as `.dizi-dumps/mitoken-unlock-pubkey.der` (SHA-256 `04f02dfd…23fae5`) with a
+  sibling `.json` recording offsets and the `R²` check. This is a public key, identical per build.
+
+**Brute force assessment: not applicable.** Forgery requires the private key, i.e. factoring a
+2048-bit modulus; the signature space is `2²⁰⁴⁸`; there is no oracle (one verification per boot, and
+`Token Verify Failed, Reboot the device` reboots on failure); and each token is bound to this unit's
+ChipId/serial/dev_name plus the current per-boot nonce, so captured tokens do not replay. The real
+gate is Xiaomi's server-side authorisation policy, not the crypto.
+
 ## Open items / next actions
 
 1. ✅ On ResearchVM: `kernel/common` @ `4ea09a298bb4` fetched, clang-r416183b downloaded, vmlinux
