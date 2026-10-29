@@ -18,6 +18,12 @@ dated entry whenever you verify, derive, or change something.
   different build, even a nearby stable point release.
 - Anything that cannot be derived offline (empirical gate fields) is recorded in the ledger as
   *unconfirmed*, not assumed.
+- **Delivery remote:** work is pushed to `git@github.com:KiralyCraft/REDMI_Unlock.git` (remote name
+  `unlock`) from 2026-10-29, per user directive. The `kiraly` remote (`REDMI_Root`) is kept for
+  history.
+- Unlock work stays on analysis of firmware already present on the target unit. It does not extend to
+  attacking Xiaomi's signing service or obtaining its private key. Findings that a check is sound are
+  reported as sound; the supported unlock route is the official token flow.
 
 ## Current focus
 

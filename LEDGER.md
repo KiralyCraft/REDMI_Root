@@ -1064,6 +1064,38 @@ provider of the protocol ABL's `oem unlock` locates.
 ChipId/serial/dev_name plus the current per-boot nonce, so captured tokens do not replay. The real
 gate is Xiaomi's server-side authorisation policy, not the crypto.
 
+### 2026-10-29 — Implementation audit: no bypassable weakness found
+
+Read-only analysis of the extracted `MiTokenDxe.efi`; no device command, no token submitted, no
+interaction with any Xiaomi service. Protected device not touched.
+
+Checked, and each is sound:
+
+- Exactly one key structure in `.data` (header word `0x40` at `0x9108`); no alternate, test or debug
+  key, and no externally controllable key source.
+- ABL's `oem unlock` (`FUN_0005db28`) calls verify (`FUN_0000199c`) and tests its return before
+  `FUN_00048908`; failure takes the reboot path. No branch unlocks without a verified signature.
+- PKCS#1 v1.5 check is complete (`00 01` + `FF` run + `00` + message); the "skip the FF loop" branch
+  is unreachable because the message length is capped at 245, forcing at least 10 padding bytes.
+  Signature buffer must be exactly `0x100`.
+- The compared message is device-generated (SMEM device name, QFPROM ChipId, serial, per-boot RNG
+  nonce); it is not attacker-supplied.
+- `FUN_0000251c` confirmed as `AsciiStrLen`; no length confusion.
+- Debug policy path (`FUN_00001a90`, SCM `0x2001401`) requires `status == 1` and the policy serial to
+  equal the chip serial, so cross-device policy blobs are rejected; the policy itself lives in the
+  secure world.
+
+**Result: no implementation weakness that permits a bypass.** Every path reduces to producing a
+signature under a key the device only verifies. The authorisation decision is made by the signing
+service; that side is out of scope here and nothing was attempted against it.
+
+Practical routes remain: the official token flow, or keeping the existing temporary-root path without
+unlocking.
+
+**Remote change (user directive):** delivery now goes to `git@github.com:KiralyCraft/REDMI_Unlock.git`
+(remote `unlock`). The `kiraly` remote is kept for history. Details in
+`docs/bootloader-unlock-DIZI.md` §4.7.
+
 ## Open items / next actions
 
 1. ✅ On ResearchVM: `kernel/common` @ `4ea09a298bb4` fetched, clang-r416183b downloaded, vmlinux

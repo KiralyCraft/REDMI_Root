@@ -338,6 +338,45 @@ account binding, eligibility and any waiting period are enforced there. The toke
 that decision to the bootloader. Bypassing the token therefore means bypassing a server-side
 authorisation policy, not solving a cryptanalytic problem, and this analysis provides no such path.
 
+### 4.7 Implementation audit for a bypassable weakness (2026-10-29)
+
+Every avenue that could let a signature be accepted without Xiaomi's signing decision was checked
+against the extracted `MiTokenDxe.efi`. None holds.
+
+1. **One key, no fallback.** A scan of `.data` finds exactly one structure with the `0x40`-word key
+   header, at `0x9108`. No second, test or debug key exists in the module, and nothing outside the
+   module can change it: the driver sits inside the signed UEFI volume, and no partition, EFI
+   variable, `misc` byte or userspace value participates in key selection.
+2. **The verification call is unconditional.** In ABL's `oem unlock` handler (`FUN_0005db28`) the
+   protocol's verify entry (`+0x10`, `FUN_0000199c`) is called and its return tested before any
+   state change; a non-zero return takes the `Token Verify Failed, Reboot the device` path and never
+   reaches `FUN_00048908`. There is no branch that sets the flags without a verified signature.
+3. **The padding check is complete.** `FUN_00001dc8` requires `00 01`, then a run of `0xFF`, then the
+   `0x00` separator, then the message byte-for-byte, and the signature buffer must be exactly
+   `0x100` bytes. The branch that skips the `0xFF` loop (`uVar9 <= 2`) is unreachable, because the
+   message length is capped at 245 (`0xf4 < param_4 - 1`), forcing at least 10 padding bytes — so the
+   familiar "short message with empty padding" acceptance does not apply here.
+4. **No attacker-chosen message.** The compared message is the device-generated base64 request from
+   `FUN_0000160c`: SMEM device name, QFPROM ChipId, serial number and 16 bytes from
+   `EFI_RNG_PROTOCOL`. Only the signature is supplied from outside. A valid signature over a message
+   you choose still requires the signing key.
+5. **No replay.** The request is cached in BSS at `0x9390` and filled only when that byte is zero, so
+   the nonce is per-boot. The debug-policy reader (`FUN_00001a90`, SCM `0x2001401`) requires
+   `status == 1` and the policy's serial to equal the chip serial; a policy blob from another device
+   is rejected and its bits are cleared.
+6. **The only local "non-secure" path is a provisioned debug policy**, and that is itself gated by a
+   key in the secure world. Nothing writable on the device can set the state bits read by
+   `FUN_0000390c` (`0x8703`) or `FUN_000038a0` (`0x8723`).
+
+**Conclusion:** the device-side implementation is sound for this threat model. There is no local
+defect that turns an unverifiable token into an accepted one. Every route reduces to producing a
+signature under a key the device only verifies — Xiaomi's unlock key, or the Qualcomm debug-policy
+key. The authorisation decision is made by the signing service, not by a check that can be skipped on
+the tablet.
+
+Scope note: this entry is firmware analysis of this unit. It does not extend to attacking Xiaomi's
+signing service or obtaining its private key, and no such work was performed.
+
 ## 5. Writability proof (non-destructive)
 
 `/sys/block/sde/sde58/ro` is `0`; the node is `brw------- root root`. The blob ends at `0x998`, so
