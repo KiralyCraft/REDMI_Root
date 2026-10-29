@@ -826,6 +826,31 @@ created under the unlocked state. If data must be kept, back up, keep stock firm
 treat the first boot as an experiment. The write itself is low-risk; the skipped wipe is the open
 question. Details and risk table: `docs/bootloader-unlock-DIZI.md` §9.1.
 
+### 2026-10-29 — Clean-start order clarified; `fastboot boot` confirmed in ABL
+
+Offline follow-up only; no adb/fastboot command, unlock, wipe, reboot or RAM boot was executed.
+
+- **Correction to the earlier command-table summary:** `boot` is present. Entry `0xb7ff0` is
+  `{name=0xb7b69, handler=0x5de1c}`; its name points into the `boot` suffix of `has-slot:boot`.
+  This string reuse hid it from the earlier enumeration summary, not from the bootloader.
+- `FUN_0005ad20` registers the entry via `FUN_0005bf98`. Dispatcher `FUN_0005a7ac` supplies the
+  downloaded buffer/length; `FUN_0005de1c` checks ordinary `is_unlocked` (`FUN_000486d8`), with
+  error `Fastboot boot command is not available in locked device`. No separate critical-unlock
+  check is present in this handler.
+- The unlocked handler loads/authenticates the downloaded image using `FUN_0000b3e8`, then calls
+  `FUN_0001bf38` (`BootLinux`), rather than flashing it. Invalid/incomplete images are rejected.
+  A/B handling may clear the active slot's unbootable flag (`FUN_00044b70`), so RAM boot is not
+  strictly a no-persistent-write operation. The booted image can also modify storage itself.
+- Thus `fastboot -s e5778c5b boot boot-test.img` is **statically supported after unlocking**; no
+  runtime success is claimed. A compatible Android boot image and matching on-device companion
+  images are still required. An ordinary reboot normally returns to the installed boot image.
+- Clean-start order: back up off-device and retain account credentials; unlock and verify the
+  stored state; reboot directly to bootloader fastboot; verify unlocked; wipe userdata and erase
+  metadata; reboot to stock Android only after both operations succeed. This is a lower-risk,
+  **untested** fresh-start plan, not a guarantee. Never erase metadata alone while retaining data.
+
+Updated `docs/bootloader-unlock-DIZI.md` §§7.1–7.2 and qualified the earlier first-boot guarantee.
+
 ## Open items / next actions
 
 1. ✅ On ResearchVM: `kernel/common` @ `4ea09a298bb4` fetched, clang-r416183b downloaded, vmlinux

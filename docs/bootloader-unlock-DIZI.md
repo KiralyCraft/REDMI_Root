@@ -111,7 +111,7 @@ of the official flow, **not** part of the lock state; a direct `devinfo` write s
 - **EDL** `FUN_0005e9f4`: unlocked bypasses the EDL token and reboots into EDL.
 - **Rollback index** `FUN_0000ef34`: when unlocked, updates the stored index instead of failing.
 
-The full fastboot command table at `0xb7f80` was enumerated (`flash:`, `erase:`, `set_active`,
+The full fastboot command table at `0xb7f80` was enumerated (`flash:`, `erase:`, `boot`, `set_active`,
 `flashing get_unlock_ability`, `oem unlock`, `oem lock`, charger/display/device-info/poweroff/
 fbreason/uart/getguid/edl/erase-vb-index/log commands, `getvar:`, `download:`, …). No locked-state
 command writes `devinfo` or bypasses the token; `oem unlock` is the only token path.
@@ -162,6 +162,58 @@ fastboot getvar unlocked               # yes
 
 `ro.boot.flash.locked` should become `0` and `ro.boot.verifiedbootstate` `orange` on the next
 Android boot. AVB verification errors are allowed from this point.
+
+### 7.1 Proposed clean-start sequence (destructive; not executed)
+
+Yes: back up off-device, apply and verify the unlock state, reboot directly to **bootloader
+fastboot**, verify that it reports unlocked, wipe userdata and erase metadata, then reboot into
+stock Android. Do not boot Android between the unlock and the planned wipe. Keep the Google/Xiaomi
+account credentials needed for activation after a reset.
+
+The following host commands are documentation only, **not authorization to execute**:
+
+```sh
+# Only AFTER the unlock write and reboot to bootloader; verify the reported state first.
+fastboot -s e5778c5b oem device-info
+# Proceed only if Device unlocked is true. These operations destroy user data and its keys.
+fastboot -s e5778c5b -w
+fastboot -s e5778c5b erase metadata
+# Reboot only after both wipe operations succeed.
+fastboot -s e5778c5b reboot
+```
+
+If an operation fails, stop rather than assuming the reset completed. Do not erase metadata alone
+while expecting to retain userdata. This is the **lower-risk fresh-start plan**, not a tested or
+risk-free procedure; `/metadata` regeneration is inferred from the stock fstab and Android code.
+
+### 7.2 Temporary RAM boot: supported by this ABL when unlocked
+
+Offline verification on 2026-10-29 confirms a real `boot` command:
+
+- Command-table entry `0xb7ff0` contains name pointer `0xb7b69` and handler `FUN_0005de1c`.
+  The name pointer reuses the NUL-terminated `boot` suffix of `has-slot:boot`, which explains why
+  `boot` was missed in the earlier command-table summary.
+- `FUN_0005ad20` registers this entry through `FUN_0005bf98`; dispatcher `FUN_0005a7ac` passes the
+  downloaded buffer and its length to the selected handler.
+- `FUN_0005de1c` checks `FUN_000486d8()` (`is_unlocked`) and rejects a locked device with
+  `Fastboot boot command is not available in locked device`. It does not additionally require
+  `is_unlock_critical`.
+- The unlocked path uses the downloaded image, calls `FUN_0000b3e8` (load/authenticate), and then
+  `FUN_0001bf38` (`BootLinux`). It can reject an invalid/incomplete image or an authentication/load
+  failure. It does not invoke the flash handler to install the downloaded image.
+
+After unlocking, the intended command is:
+
+```sh
+fastboot -s e5778c5b boot boot-test.img
+```
+
+Use a compatible **Android boot image**, not an arbitrary raw kernel or EFI executable. Other
+required images/configuration (for example, vendor_boot, DTBO and init_boot where applicable)
+remain on storage and must be compatible. Normally the next reboot uses the installed image again.
+This is not a no-write sandbox: the handler can clear the active slot's unbootable flag through
+`FUN_00044b70`, and the booted kernel/recovery can write persistent storage. **Support is confirmed
+from the exact ABL code; an actual RAM boot has not been tested.**
 
 ## 8. Re-lock
 
@@ -277,9 +329,9 @@ metadata key survives the boot-state change.
    `fastboot -w` (userdata/cache) **and** `fastboot erase metadata` (the metadata key), or use the
    official token unlock / `--wipe_data` recovery path. `/metadata` is `formattable,first_stage_mount`
    in both fstabs, so an erased metadata partition is expected to be reformatted at first boot and
-   the key regenerated. The first Android boot then creates a fresh metadata key under the unlocked
-   state, so the key-binding question cannot soft-brick the device. This is the only procedure that
-   removes the main uncertainty.
+   the key regenerated. This is expected to remove dependence on pre-unlock metadata keys, but the
+   full reset/first-boot sequence has not been device-tested and is not a general boot guarantee.
+   See §7.1 for the targeted command order; never erase metadata alone to preserve userdata.
 2. **Data must be kept.** Back up first, then accept that the first boot is an experiment: keep the
    stock firmware and EDL/fastboot recovery available, verify that `/data` mounts and the user data
    is intact, and be prepared to factory reset if it does not. A sacrificial unit is preferable.
