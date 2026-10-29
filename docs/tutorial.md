@@ -4,6 +4,14 @@
 > kernel `5.10.236-android12-9-00003-gfb24cf99ad97-ab14313284`) from scratch.
 > No prior kernel-exploitation background is required; just read the chapters in order.
 
+> **Update 2026-10-29 (5.10.209 build):** KernelSU is no longer required, and
+> `ksud late-load` cannot work on this stock kernel (it needs a KernelSU driver syscall that
+> the kernel does not have). The rooted handoff now starts a small userspace agent
+> (`ghostsu`) instead; `/data/local/tmp/su -c id` and `/data/local/tmp/su` give a temporary
+> root until reboot. See [`device-gate-DIZI-02.md`](device-gate-DIZI-02.md) and the
+> 2026-10-29 LEDGER entry. The KernelSU-specific wiring below still describes the older
+> 5.10.236 run.
+
 ## How it works (overview)
 
 ```mermaid
@@ -304,9 +312,10 @@ echo $ANDROID_NDK_HOME # or let build.sh auto-detect it
 3. Confirm the kernel version: About tablet → Kernel version must be
    `5.10.236-android12-9-00003-gfb24cf99ad97-ab14313284` (a different version cannot use
    this profile);
-4. Install the KernelSU manager APK (https://github.com/tiann/KernelSU/releases).
-   **This step is mandatory** — the root script extracts ksud from that package to load
-   the kernel module;
+4. (Optional) Install the KernelSU manager APK (https://github.com/tiann/KernelSU/releases).
+   It is **not required** for the temporary root: on the 5.10.209 build the handoff starts
+   the `ghostsu` agent directly. It was mandatory only for the older 5.10.236 KernelSU
+   flow;
 5. Connect the tablet to the computer over USB and accept the debugging authorization.
 
 ### 5.3 Build

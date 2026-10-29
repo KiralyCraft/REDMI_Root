@@ -24,8 +24,8 @@ adapted and verified on real hardware.
 - Result: temporary root until reboot (a userspace `su` channel backed by the rooted
   handoff; no bootloader unlock, no boot image modification, no kernel module required).
   KernelSU is still attempted when a manager is installed, but it is not needed.
-- Device gate: two consecutive cold-boot end-to-end passes (record in
-  `docs/device-gate-DIZI-01.md`)
+- Device gate: `docs/device-gate-DIZI-02.md` records the 5.10.209 pass (temporary root
+  through `ghostsu`); `docs/device-gate-DIZI-01.md` is the older 5.10.236 KernelSU run
 
 A profile is never used across builds: `tools/reroot.sh` reads `uname -r` from the device
 and refuses to run when no profile for that exact build exists.

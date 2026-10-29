@@ -632,8 +632,35 @@ build; `src/core/kernel/constants.hpp` now `#undef`s it. The known-good binary w
 with **NDK 29.0.14206865 on ResearchVM** (`/bigdata/android-sdk/ndk/29.0.14206865`, clang
 21.0.0) — use that toolchain for any exploit rebuild, to keep codegen comparable.
 
-**Gate run 6** (`/tmp/opencode/gate-209-agent-run6.log`) started 07:56 with the agent
-stack; result pending.
+**Gate run 6** (`/tmp/opencode/gate-209-agent-run6.log`) — **PASS**, temporary root
+reached on attempt 9 / W2 try 1 (08:06, cold boot, `e5778c5b` only):
+
+```
+== ROOTED (attempt 9, try 1)
+uid=0(root) gid=1514833792(u15148_a3792_ext) groups=1514833792(...) context=u:r:kernel:s0
+Uid: 0 0 0 0
+Gid: 1514833792 1514833792 1514833792 1514833792
+CapEff: 000001ffffffffff
+```
+
+- The rooted handoff script ran as uid 0, the `ksud` shim logged
+  `[*] ghostsu agent running: /data/local/tmp/su -c id`, and `.ghostsu.log` records
+  `[*] agent start uid=0 label=u:r:kernel:s0`.
+- `/data/local/tmp/su -c id` → `uid=0(root)`, `CapEff=000001ffffffffff`; `ls /data/misc/keystore`
+  and `dmesg` (as root) work; the device stays permissive (`enforce=0`, AVC denials show
+  `permissive=1`) until reboot.
+- Interactive path verified on the device: `adb shell /data/local/tmp/su` gives a `dizi:/ #`
+  shell; `id -u` → 0; `exit` closes it. Commands from later adb sessions also reach the agent
+  (it is independent of the exploit process).
+- **Observed artifact (unexplained, not blocking):** the rooted cred has uid 0 but
+  gid/groups `1514833792` instead of 0, so the exploit does not install pristine `init_cred`
+  (the uid fields are the crafted part). With full capabilities and SELinux permissive every
+  root operation tested so far succeeds; recorded rather than assumed normal.
+- This is a temporary root: reboot clears the agent and restores enforcing. The abstract socket
+  is reachable by any process on the device while permissive — acceptable only inside a
+  controlled test window.
+
+**Status: the stated goal (a temporary root shell from adb, no bootloader unlock) is met.**
 
 ## Open items / next actions
 
@@ -647,8 +674,9 @@ stack; result pending.
    236 profile, pointer-chase content). A future re-derivation must assert the same anchors.
 4. ⏳ Confirm the empirical fields via a device gate run (`kernel_phys_load`, `skb_reclaim_sends`,
    `skb_frag_bias`); panics/reboots expected; requires explicit user authorization.
-5. The new profile is derived and build-exact but **not gate-verified** — record a cold-boot PASS here
-   before treating it as production-ready.
+5. The 5.10.209 profile passed its first cold-boot gate run on 2026-10-29 (run 6: W1 + W2,
+   temporary root via `ghostsu`; entry above and `docs/device-gate-DIZI-02.md`). A **second**
+   consecutive cold-boot pass is still open before calling it production-ready.
 6. ⏳ Bootloader vulnerability hunt. The ABL volume decodes (LZMA-alone framing) and the
    `oem unlock` handler is now read: the unlock flag is an unauthenticated byte in the persisted
    `ANDROID-BOOT!` device-info blob, so the server signature gates the command, not the storage.
